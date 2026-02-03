@@ -24,8 +24,8 @@ Issues = "https://github.com/fgregg/postgres-fts-backend/issues"
 DJANGO_SETTINGS_MODULE = "tests.settings"
 pythonpath = ["."]
 
-[tool.setuptools]
-packages = ["postgres_fts_backend"]
+[tool.setuptools.packages.find]
+include = ["postgres_fts_backend*"]
 
 [tool.ruff]
 # Optionally set target Python version and line length for consistency
