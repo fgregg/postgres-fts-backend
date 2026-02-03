@@ -1,6 +1,6 @@
 from haystack import indexes
 
-from tests.core.models import AnotherMockModel, MockModel
+from tests.core.models import AnotherMockModel, MockModel, ScoreMockModel
 
 
 class MockSearchIndex(indexes.SearchIndex, indexes.Indexable):
@@ -18,3 +18,11 @@ class AnotherMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
 
     def get_model(self):
         return AnotherMockModel
+
+
+class ScoreMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
+    text = indexes.CharField(document=True, model_attr="score")
+    score = indexes.CharField(model_attr="score")
+
+    def get_model(self):
+        return ScoreMockModel

@@ -14,6 +14,7 @@ from django.contrib.postgres.search import SearchQuery, SearchVectorField
 from django.core.exceptions import FieldError
 from django.core.management import call_command
 from django.db import DatabaseError, connection, models
+from django.db.models import FloatField, Value
 from django.test import TestCase, override_settings
 from haystack import connections
 from haystack import indexes as haystack_indexes
@@ -23,9 +24,13 @@ from haystack.utils.loading import UnifiedIndex
 import postgres_fts_backend.models as models_module
 from postgres_fts_backend import validate_all_schemas
 from postgres_fts_backend.models import generate_index_models, get_index_model
-from tests.core.models import AnotherMockModel, MockModel
+from tests.core.models import AnotherMockModel, MockModel, ScoreMockModel
 from tests.mocks import MockSearchResult
-from tests.search_indexes import AnotherMockSearchIndex, MockSearchIndex
+from tests.search_indexes import (
+    AnotherMockSearchIndex,
+    MockSearchIndex,
+    ScoreMockSearchIndex,
+)
 
 
 def backend_setup(test_case, indexes_to_register):
@@ -848,16 +853,317 @@ class TestMultiModelSearch(TestCase):
         expected = MockModel.objects.count() + AnotherMockModel.objects.count()
         assert total == expected
 
-    def test_search_across_models_not_supported(self):
-        """Searching across multiple models should raise NotImplementedError."""
-        with pytest.raises(NotImplementedError):
-            self.backend.search("daniel3")
+    def test_search_across_all_models(self):
+        """Searching '*' across all models returns combined hit count."""
+        results = self.backend.search("*")
+        expected = MockModel.objects.count() + AnotherMockModel.objects.count()
+        assert results["hits"] == expected
+
+    def test_search_returns_both_models(self):
+        """Searching 'daniel3' returns results from both model types."""
+        results = self.backend.search("daniel3")
+        model_types = {r.model for r in results["results"]}
+        assert MockModel in model_types
+        assert AnotherMockModel in model_types
+
+    def test_relevance_scores(self):
+        """Multi-model results have non-zero scores."""
+        results = self.backend.search("daniel3")
+        assert results["hits"] > 0
+        for r in results["results"]:
+            assert r.score > 0
+
+    def test_ordered_by_relevance(self):
+        """Multi-model results are ordered by descending score."""
+        results = self.backend.search("daniel3")
+        scores = [r.score for r in results["results"]]
+        assert scores == sorted(scores, reverse=True)
+
+    def test_pagination(self):
+        """start_offset/end_offset work; hits reflects the total."""
+        total = self.backend.search("*")["hits"]
+        page = self.backend.search("*", start_offset=0, end_offset=5)
+        assert len(page["results"]) == 5
+        assert page["hits"] == total
+
+    def test_no_duplicate_across_pages(self):
+        """Paging through all results yields no duplicates."""
+        page_size = 5
+        all_ids = []
+        total = self.backend.search("*")["hits"]
+        offset = 0
+        while offset < total:
+            page = self.backend.search(
+                "*", start_offset=offset, end_offset=offset + page_size
+            )
+            for r in page["results"]:
+                all_ids.append((r.app_label, r.model_name, r.pk))
+            offset += page_size
+        assert len(all_ids) == total
+        assert len(all_ids) == len(set(all_ids))
+
+    def test_explicit_multi_model_list(self):
+        """models=[MockModel, AnotherMockModel] works."""
+        results = self.backend.search("*", models=[MockModel, AnotherMockModel])
+        expected = MockModel.objects.count() + AnotherMockModel.objects.count()
+        assert results["hits"] == expected
+
+    def test_narrow_field_on_one_model(self):
+        """Narrowing by 'author' (only on MockModel) excludes AnotherMockModel gracefully."""
+        results = self.backend.search("*", narrow_queries=['author:"daniel1"'])
+        assert results["hits"] > 0
+        for r in results["results"]:
+            assert r.model == MockModel
+
+    def test_facets_shared_field(self):
+        """Date facets on pub_date (both models) merge counts."""
+        results = self.backend.search(
+            "*",
+            date_facets={
+                "pub_date": {
+                    "start_date": datetime(2009, 1, 1),
+                    "end_date": datetime(2010, 1, 1),
+                    "gap_by": "month",
+                }
+            },
+        )
+        buckets = results["facets"]["dates"]["pub_date"]
+        total_count = sum(count for _, count in buckets)
+        expected = MockModel.objects.count() + AnotherMockModel.objects.count()
+        assert total_count == expected
+
+    def test_facets_exclusive_field(self):
+        """Field facets on 'author' (one model only) work without error."""
+        results = self.backend.search("*", facets=["author"])
+        assert "author" in results["facets"]["fields"]
+        total_count = sum(c for _, c in results["facets"]["fields"]["author"])
+        # Only MockModel has the author field in its index
+        assert total_count == MockModel.objects.count()
+
+    def test_highlight(self):
+        """Highlighting works across models."""
+        results = self.backend.search("daniel3", highlight=True)
+        assert results["hits"] > 0
+        highlighted_count = sum(
+            1 for r in results["results"] if hasattr(r, "highlighted")
+        )
+        assert highlighted_count > 0
+
+    def test_sort_by_field_on_one_model(self):
+        """Sorting by 'author' works; AnotherMockModel rows get None."""
+        results = self.backend.search("*", sort_by=["author"])
+        authors = [getattr(r, "author", None) for r in results["results"]]
+        # PostgreSQL sorts NULLs last in ASC
+        non_none = [a for a in authors if a is not None]
+        none_count = authors.count(None)
+        assert none_count > 0
+        assert authors == non_none + [None] * none_count
 
     def test_search_filtered_to_model(self):
         """Searching with a model filter should restrict results to that model."""
         results = self.backend.search("daniel3", models=[MockModel])
         for result in results["results"]:
             assert result.model == MockModel
+
+
+# ---------------------------------------------------------------------------
+# aligned_union
+# ---------------------------------------------------------------------------
+
+
+class TestAlignedUnion(TestCase):
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.mock_index = MockSearchIndex()
+        self.another_index = AnotherMockSearchIndex()
+        backend_setup(self, [self.mock_index, self.another_index])
+        self.backend.update(self.mock_index, MockModel.objects.all())
+        self.backend.update(self.another_index, AnotherMockModel.objects.all())
+        self.mock_index_model = get_index_model(MockModel)
+        self.another_index_model = get_index_model(AnotherMockModel)
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_union_count_matches_sum(self):
+        """Union of two querysets has count == sum of individual counts."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        assert result.count() == qs1.count() + qs2.count()
+
+    def test_columns_are_superset(self):
+        """Rows from the union contain all columns from both models."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        row = list(result)[0]
+        assert "author" in row
+        assert "pub_date" in row
+        assert "text" in row
+
+    def test_missing_columns_are_none(self):
+        """AnotherMockModel rows have author=None in the union."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        another_ct = (
+            f"{AnotherMockModel._meta.app_label}.{AnotherMockModel._meta.model_name}"
+        )
+        for row in result:
+            if row["django_ct"] == another_ct:
+                assert row["author"] is None
+
+    def test_present_columns_retain_values(self):
+        """MockModel rows have their actual author values preserved."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        mock_ct = f"{MockModel._meta.app_label}.{MockModel._meta.model_name}"
+        for row in result:
+            if row["django_ct"] == mock_ct:
+                assert row["author"] is not None
+
+    def test_order_by_shared_field(self):
+        """.order_by('pub_date') works on the union."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        rows = list(result.order_by("pub_date"))
+        dates = [r["pub_date"] for r in rows]
+        assert dates == sorted(dates)
+
+    def test_order_by_exclusive_field(self):
+        """.order_by('author') works; NULLs sort last (ASC, PostgreSQL default)."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        rows = list(result.order_by("author"))
+        authors = [r["author"] for r in rows]
+        # PostgreSQL sorts NULLs last in ASC
+        non_none = [a for a in authors if a is not None]
+        none_count = authors.count(None)
+        assert none_count > 0
+        assert authors == non_none + [None] * none_count
+
+    def test_slicing(self):
+        """union_qs[2:5] returns exactly 3 rows."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        sliced = list(result.order_by("django_ct", "django_id")[2:5])
+        assert len(sliced) == 3
+
+    def test_pagination_no_duplicates(self):
+        """Paging through the union yields no duplicate (django_ct, django_id) pairs."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        result = qs1.aligned_union(qs2)
+        ordered = result.order_by("django_ct", "django_id")
+        total = ordered.count()
+        all_ids = []
+        page_size = 5
+        for offset in range(0, total, page_size):
+            for row in ordered[offset : offset + page_size]:
+                all_ids.append((row["django_ct"], row["django_id"]))
+        assert len(all_ids) == total
+        assert len(all_ids) == len(set(all_ids))
+
+    def test_rank_annotation_preserved(self):
+        """If querysets have rank annotations, values carry through the union."""
+        qs1 = self.mock_index_model.objects.search("daniel3")
+        qs2 = self.another_index_model.objects.search("daniel3")
+        result = qs1.aligned_union(qs2)
+        for row in result:
+            assert "rank" in row
+            assert row["rank"] is not None
+
+    def test_union_with_rank_on_some(self):
+        """One queryset has rank, other has Value(0); both appear."""
+        qs1 = self.mock_index_model.objects.search("daniel3")
+        qs2 = self.another_index_model.objects.all().annotate(
+            rank=Value(0, output_field=FloatField())
+        )
+        result = qs1.aligned_union(qs2)
+        ranks = [row["rank"] for row in result]
+        assert any(r > 0 for r in ranks)
+        assert any(r == 0 for r in ranks)
+
+
+# ---------------------------------------------------------------------------
+# Three-model aligned_union
+# ---------------------------------------------------------------------------
+
+
+class TestThreeModelAlignedUnion(TestCase):
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.mock_index = MockSearchIndex()
+        self.another_index = AnotherMockSearchIndex()
+        self.score_index = ScoreMockSearchIndex()
+        backend_setup(self, [self.mock_index, self.another_index, self.score_index])
+        self.backend.update(self.mock_index, MockModel.objects.all())
+        self.backend.update(self.another_index, AnotherMockModel.objects.all())
+        self.backend.update(self.score_index, ScoreMockModel.objects.all())
+        self.mock_index_model = get_index_model(MockModel)
+        self.another_index_model = get_index_model(AnotherMockModel)
+        self.score_index_model = get_index_model(ScoreMockModel)
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_three_way_union_count(self):
+        """Union of three querysets has count == sum of individual counts."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        qs3 = self.score_index_model.objects.all()
+        result = qs1.aligned_union(qs2).aligned_union(qs3)
+        assert result.count() == qs1.count() + qs2.count() + qs3.count()
+
+    def test_three_way_columns_are_superset(self):
+        """Rows from the 3-way union contain all columns from all models."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        qs3 = self.score_index_model.objects.all()
+        result = qs1.aligned_union(qs2).aligned_union(qs3)
+        row = list(result)[0]
+        # author only on MockModel, pub_date on Mock+Another, score only on ScoreMock
+        assert "author" in row
+        assert "pub_date" in row
+        assert "score" in row
+        assert "text" in row
+
+    def test_three_way_missing_columns_are_none(self):
+        """Models missing a column get None for that column."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        qs3 = self.score_index_model.objects.all()
+        result = qs1.aligned_union(qs2).aligned_union(qs3)
+        score_ct = f"{ScoreMockModel._meta.app_label}.{ScoreMockModel._meta.model_name}"
+        another_ct = (
+            f"{AnotherMockModel._meta.app_label}.{AnotherMockModel._meta.model_name}"
+        )
+        for row in result:
+            if row["django_ct"] == score_ct:
+                # ScoreMockModel has no author or pub_date
+                assert row["author"] is None
+                assert row["pub_date"] is None
+            if row["django_ct"] == another_ct:
+                # AnotherMockModel has no author or score
+                assert row["author"] is None
+                assert row["score"] is None
+
+    def test_three_way_order_by(self):
+        """Ordering by django_ct, django_id works on the 3-way union."""
+        qs1 = self.mock_index_model.objects.all()
+        qs2 = self.another_index_model.objects.all()
+        qs3 = self.score_index_model.objects.all()
+        result = qs1.aligned_union(qs2).aligned_union(qs3)
+        rows = list(result.order_by("django_ct", "django_id"))
+        keys = [(r["django_ct"], r["django_id"]) for r in rows]
+        assert keys == sorted(keys)
 
 
 # ---------------------------------------------------------------------------
@@ -1070,6 +1376,7 @@ class TestMigrationChangeDetection(TestCase):
 
         self.index = MockSearchIndex()
         self.another_index = AnotherMockSearchIndex()
+        self.score_index = ScoreMockSearchIndex()
 
     def tearDown(self):
         self.models_module._index_models_cache.clear()
@@ -1107,7 +1414,9 @@ class TestMigrationChangeDetection(TestCase):
         class ExtendedMockSearchIndex(MockSearchIndex):
             extra_field = haystack_indexes.IntegerField(default=0)
 
-        backend_setup(self, [ExtendedMockSearchIndex(), self.another_index])
+        backend_setup(
+            self, [ExtendedMockSearchIndex(), self.another_index, self.score_index]
+        )
         self.models_module._index_models_cache.clear()
 
         module_name = "temp_mig_addfield"
@@ -1135,7 +1444,9 @@ class TestMigrationChangeDetection(TestCase):
         class ExtendedMockSearchIndex(MockSearchIndex):
             extra_field = haystack_indexes.IntegerField(default=0)
 
-        backend_setup(self, [ExtendedMockSearchIndex(), self.another_index])
+        backend_setup(
+            self, [ExtendedMockSearchIndex(), self.another_index, self.score_index]
+        )
         self.models_module._index_models_cache.clear()
 
         module_name = "temp_mig_apply"
@@ -1158,7 +1469,7 @@ class TestMigrationChangeDetection(TestCase):
             # Roll back: restore original indexes, regenerate, and migrate
             self.models_module._index_models_cache.clear()
             backend_teardown(self)
-            backend_setup(self, [self.index, self.another_index])
+            backend_setup(self, [self.index, self.another_index, self.score_index])
             self.models_module._index_models_cache.clear()
 
             call_command("build_postgres_schema", verbosity=0)
@@ -1178,7 +1489,7 @@ class TestMigrationChangeDetection(TestCase):
 
     def test_no_changes_detected_when_schema_matches(self):
         """With standard indexes, build_postgres_schema outputs 'No changes detected'."""
-        backend_setup(self, [self.index, self.another_index])
+        backend_setup(self, [self.index, self.another_index, self.score_index])
 
         module_name = "temp_mig_nochange"
         pkg_dir = self._make_migration_package(module_name)
@@ -1589,6 +1900,7 @@ class TestTrigramSupport(TestCase):
         self._saved_cache = models_module._index_models_cache.copy()
         models_module._index_models_cache.clear()
         self.another_index = AnotherMockSearchIndex()
+        self.score_index = ScoreMockSearchIndex()
 
     def tearDown(self):
         self.models_module._index_models_cache.clear()
@@ -1629,7 +1941,7 @@ class TestTrigramSupport(TestCase):
     def test_generate_index_models_includes_trigram_index(self):
         """EdgeNgramField gets a GIN trigram index when pg_trgm is installed."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index])
+        backend_setup(self, [ngram_index, self.another_index, self.score_index])
         try:
             schema = generate_index_models()
             indexes = schema[MockModel]._meta.indexes
@@ -1644,7 +1956,7 @@ class TestTrigramSupport(TestCase):
     def test_migration_adds_trigram_index(self):
         """Switching author to EdgeNgramField generates an AddIndex with gin_trgm_ops."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index])
+        backend_setup(self, [ngram_index, self.another_index, self.score_index])
         try:
             module_name = "temp_mig_trgm_add"
             pkg_dir = self._make_migration_package(module_name)
@@ -1669,7 +1981,7 @@ class TestTrigramSupport(TestCase):
     def test_trigram_index_used_for_similarity_query(self):
         """EXPLAIN shows the GIN trigram index for a trigram_similar lookup."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index])
+        backend_setup(self, [ngram_index, self.another_index, self.score_index])
         try:
             with connection.cursor() as cursor:
                 cursor.execute(

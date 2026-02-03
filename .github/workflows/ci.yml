@@ -12,9 +12,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
-      - run: pip install ruff black
+      - run: pip install -e ".[dev]"
       - run: ruff check postgres_fts_backend/ tests/
       - run: black --check .
+      - run: mypy postgres_fts_backend/
 
   test:
     runs-on: ${{ matrix.os }}

@@ -79,4 +79,36 @@ class Migration(migrations.Migration):
                 "unique_together": {("django_ct", "django_id")},
             },
         ),
+        migrations.CreateModel(
+            name="HaystackIndex_Core_Scoremockmodel",
+            fields=[
+                (
+                    "id",
+                    models.AutoField(
+                        auto_created=True,
+                        primary_key=True,
+                        serialize=False,
+                        verbose_name="ID",
+                    ),
+                ),
+                ("django_id", models.CharField(max_length=255)),
+                ("django_ct", models.CharField(max_length=255)),
+                (
+                    "search_vector",
+                    django.contrib.postgres.search.SearchVectorField(null=True),
+                ),
+                ("text", models.TextField(null=True)),
+                ("score", models.TextField(null=True)),
+            ],
+            options={
+                "db_table": "haystack_index_core_scoremockmodel",
+                "indexes": [
+                    django.contrib.postgres.indexes.GinIndex(
+                        fields=["search_vector"],
+                        name="haystack_index_core_scoremockmodel_sv_gin",
+                    )
+                ],
+                "unique_together": {("django_ct", "django_id")},
+            },
+        ),
     ]

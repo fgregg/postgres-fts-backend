@@ -13,7 +13,7 @@ readme = "README.md"
 classifiers = ["License :: OSI Approved :: MIT License"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-django", "ruff", "black"]
+dev = ["pytest", "pytest-django", "ruff", "black", "mypy", "django-stubs"]
 
 
 [project.urls]
@@ -27,6 +27,13 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["postgres_fts_backend*"]
+
+[tool.mypy]
+plugins = ["mypy_django_plugin.main"]
+ignore_missing_imports = true
+
+[tool.django-stubs]
+django_settings_module = "tests.settings"
 
 [tool.ruff]
 # Optionally set target Python version and line length for consistency

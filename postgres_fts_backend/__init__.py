@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import logging
 import re
 import warnings
+from typing import Any, NotRequired, TypedDict
 
 from django.apps import apps as django_apps
 from django.contrib.postgres.search import (
@@ -9,8 +12,9 @@ from django.contrib.postgres.search import (
     SearchRank,
     SearchVector,
 )
-from django.db import DatabaseError, connection
-from django.db.models import Count, F, Q
+from django.core.exceptions import FieldDoesNotExist
+from django.db import DatabaseError, connection, models
+from django.db.models import Count, F, FloatField, Q, Value
 from django.db.models.functions import Trunc
 from django.utils.encoding import force_str
 from haystack import connections
@@ -22,21 +26,46 @@ from haystack.backends import (
     log_query,
 )
 from haystack.constants import DJANGO_CT, DJANGO_ID
+from haystack.indexes import SearchIndex
 from haystack.models import SearchResult
 from haystack.utils import get_model_ct
 
-from postgres_fts_backend.models import generate_index_models, get_index_model
+from postgres_fts_backend.models import (
+    AlignedUnionQuerySet,
+    IndexQuerySet,
+    generate_index_models,
+    get_index_model,
+)
+
+
+class FacetResults(TypedDict, total=False):
+    fields: dict[str, list[tuple[Any, int]]]
+    dates: dict[str, list[tuple[Any, int]]]
+    queries: dict[str, int]
+
+
+class SearchResponse(TypedDict):
+    results: list[SearchResult]
+    hits: int
+    spelling_suggestion: str | None
+    facets: NotRequired[FacetResults]
+
+
+class _CtInfo(TypedDict):
+    model: type[models.Model]
+    field_names: list[str]
+
 
 default_app_config = "postgres_fts_backend.apps.PostgresFTSConfig"
 
 log = logging.getLogger("haystack")
 
 
-def _table_name(model):
+def _table_name(model: type[models.Model]) -> str:
     return f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
 
 
-def validate_all_schemas():
+def validate_all_schemas() -> None:
     """Validate all index tables at startup. Called from AppConfig.ready()."""
     try:
         ui = connections["default"].get_unified_index()
@@ -83,17 +112,17 @@ def validate_all_schemas():
             )
 
 
-def _field_names(index):
+def _field_names(index: SearchIndex) -> list[str]:
     return [name for name in index.fields if name not in ("django_ct", "django_id")]
 
 
-def _resolve_field_name(field_name):
+def _resolve_field_name(field_name: str) -> str:
     if field_name.endswith("_exact"):
         return field_name[:-6]
     return field_name
 
 
-def _parse_narrow_query(query_string):
+def _parse_narrow_query(query_string: str) -> tuple[str, str]:
     match = re.match(r'^(\w+):"(.+)"$', query_string)
     if not match:
         raise ValueError(f"Cannot parse narrow query: '{query_string}'")
@@ -101,39 +130,54 @@ def _parse_narrow_query(query_string):
 
 
 class IndexSearch:
-    def __init__(self, qs, index, search_config, has_rank=False, search_text=None):
+    def __init__(
+        self,
+        qs: IndexQuerySet,
+        index: SearchIndex,
+        search_config: str,
+        has_rank: bool = False,
+        search_text: str | None = None,
+    ) -> None:
         self.qs = qs
         self.index = index
-        self.search_config = search_config
-        self.has_rank = has_rank
-        self.search_text = search_text
-        self.score_field = "rank"
-        self.highlight_field = None
+        self.search_config: str = search_config
+        self.has_rank: bool = has_rank
+        self.search_text: str | None = search_text
+        self.score_field: str = "rank"
+        self.highlight_field: str | None = None
 
     @classmethod
-    def from_query_string(cls, index_model, index, search_config, query_string):
+    def from_query_string(
+        cls,
+        index_model: type[models.Model],
+        index: SearchIndex,
+        search_config: str,
+        query_string: str,
+    ) -> IndexSearch:
         if query_string == "*":
-            return cls(index_model.objects.all(), index, search_config)
+            qs = index_model.objects.all().annotate(  # type: ignore[attr-defined]
+                rank=Value(0, output_field=FloatField())
+            )
+            return cls(qs, index, search_config)
 
         if ":" in query_string and not query_string.startswith('"'):
             field, _, value = query_string.partition(":")
             content_field = index.get_content_field()
             if field == content_field:
                 return cls(
-                    index_model.objects.search(value, config=search_config),
+                    index_model.objects.search(value, config=search_config),  # type: ignore[attr-defined]
                     index,
                     search_config,
                     has_rank=True,
                     search_text=value,
                 )
-            return cls(
-                index_model.objects.filter(**{field: value}),
-                index,
-                search_config,
+            qs = index_model.objects.filter(**{field: value}).annotate(  # type: ignore[attr-defined]
+                rank=Value(0, output_field=FloatField())
             )
+            return cls(qs, index, search_config)
 
         return cls(
-            index_model.objects.search(query_string, config=search_config),
+            index_model.objects.search(query_string, config=search_config),  # type: ignore[attr-defined]
             index,
             search_config,
             has_rank=True,
@@ -141,11 +185,19 @@ class IndexSearch:
         )
 
     @classmethod
-    def from_orm_query(cls, index_model, index, search_config, orm_query):
-        content_search_text = orm_query.content_search_text
-        qs = index_model.objects.filter(orm_query)
+    def from_orm_query(
+        cls,
+        index_model: type[models.Model],
+        index: SearchIndex,
+        search_config: str,
+        orm_query: Q,
+    ) -> IndexSearch:
+        content_search_text = orm_query.content_search_text  # type: ignore[attr-defined]
+        qs = index_model.objects.filter(orm_query)  # type: ignore[attr-defined]
         if content_search_text:
             qs = qs.ranked(content_search_text, config=search_config)
+        else:
+            qs = qs.annotate(rank=Value(0, output_field=FloatField()))
         return cls(
             qs,
             index,
@@ -154,15 +206,20 @@ class IndexSearch:
             search_text=content_search_text,
         )
 
-    def narrow(self, narrow_queries):
+    def narrow(self, narrow_queries: list[str]) -> None:
         for nq in narrow_queries:
             field, value = _parse_narrow_query(nq)
             col = _resolve_field_name(field)
+            try:
+                self.qs.model._meta.get_field(col)
+            except FieldDoesNotExist:
+                self.qs = self.qs.none()
+                return
             self.qs = self.qs.filter(**{col: value})
 
-    def highlight(self):
+    def highlight(self) -> None:
         if self.search_text is None:
-            return self
+            return
         content_field = self.index.get_content_field()
         sq = SearchQuery(
             self.search_text, search_type="websearch", config=self.search_config
@@ -172,11 +229,11 @@ class IndexSearch:
         )
         self.highlight_field = content_field
 
-    def boost(self, boost_dict):
+    def boost(self, boost_dict: dict[str, float]) -> None:
         if not self.has_rank or not boost_dict:
-            return self
-        annotations = {}
-        combined = F("rank")
+            return
+        annotations: dict[str, Any] = {}
+        combined: Any = F("rank")
         for i, (term, weight) in enumerate(boost_dict.items()):
             alias = f"_boost_{i}"
             bq = SearchQuery(term, search_type="websearch", config=self.search_config)
@@ -188,11 +245,16 @@ class IndexSearch:
         self.qs = self.qs.annotate(**annotations)
         self.score_field = "_boosted_rank"
 
-    def count(self):
+    def count(self) -> int:
         return self.qs.count()
 
-    def facets(self, facets=None, date_facets=None, query_facets=None):
-        result = {}
+    def facets(
+        self,
+        facets: list[str] | None = None,
+        date_facets: dict[str, Any] | None = None,
+        query_facets: list[tuple[str, str]] | None = None,
+    ) -> FacetResults:
+        result: FacetResults = {}
 
         if facets:
             result["fields"] = {}
@@ -240,8 +302,12 @@ class IndexSearch:
         return result
 
     def results(
-        self, sort_by=None, start_offset=0, end_offset=None, result_class=SearchResult
-    ):
+        self,
+        sort_by: list[str] | None = None,
+        start_offset: int = 0,
+        end_offset: int | None = None,
+        result_class: type = SearchResult,
+    ) -> list[SearchResult]:
         qs = self.qs
 
         # Ordering
@@ -274,6 +340,142 @@ class IndexSearch:
             results.append(
                 result_class(
                     app_label, model_name, obj.django_id, score, **stored_fields
+                )
+            )
+        return results
+
+
+class MultiIndexSearch:
+    """Wraps multiple IndexSearch instances for cross-model search."""
+
+    def __init__(self, searches: list[tuple[IndexSearch, type[models.Model]]]) -> None:
+        self.searches = searches
+
+    def count(self) -> int:
+        return sum(s.count() for s, _model in self.searches)
+
+    def facets(
+        self,
+        facets: list[str] | None = None,
+        date_facets: dict[str, Any] | None = None,
+        query_facets: list[tuple[str, str]] | None = None,
+    ) -> FacetResults:
+        merged: FacetResults = {}
+
+        if facets:
+            merged["fields"] = {}
+            for field_name in facets:
+                col = _resolve_field_name(field_name)
+                combined_counts: dict[Any, int] = {}
+                for s, model in self.searches:
+                    index_model = get_index_model(model)
+                    try:
+                        index_model._meta.get_field(col)
+                    except FieldDoesNotExist:
+                        continue
+                    sub = s.facets(facets=[field_name])
+                    for value, count in sub.get("fields", {}).get(field_name, []):
+                        combined_counts[value] = combined_counts.get(value, 0) + count
+                merged["fields"][field_name] = sorted(
+                    combined_counts.items(), key=lambda x: (-x[1], x[0])
+                )
+
+        if date_facets:
+            merged["dates"] = {}
+            for field_name, facet_opts in date_facets.items():
+                col = _resolve_field_name(field_name)
+                combined_buckets: dict[Any, int] = {}
+                for s, model in self.searches:
+                    index_model = get_index_model(model)
+                    try:
+                        index_model._meta.get_field(col)
+                    except FieldDoesNotExist:
+                        continue
+                    sub = s.facets(date_facets={field_name: facet_opts})
+                    for bucket, count in sub.get("dates", {}).get(field_name, []):
+                        combined_buckets[bucket] = (
+                            combined_buckets.get(bucket, 0) + count
+                        )
+                merged["dates"][field_name] = sorted(combined_buckets.items())
+
+        if query_facets:
+            merged["queries"] = {}
+            for field_name, value in query_facets:
+                col = _resolve_field_name(field_name)
+                total = 0
+                for s, model in self.searches:
+                    index_model = get_index_model(model)
+                    try:
+                        index_model._meta.get_field(col)
+                    except FieldDoesNotExist:
+                        continue
+                    sub = s.facets(query_facets=[(field_name, value)])
+                    key = f"{field_name}_{value}"
+                    total += sub.get("queries", {}).get(key, 0)
+                merged["queries"][f"{field_name}_{value}"] = total
+
+        return merged
+
+    def results(
+        self,
+        sort_by: list[str] | None = None,
+        start_offset: int = 0,
+        end_offset: int | None = None,
+        result_class: type = SearchResult,
+    ) -> list[SearchResult]:
+        # These are uniform across all searches (same kwargs applied to each)
+        first_search = self.searches[0][0]
+        score_field = first_search.score_field
+        has_rank = first_search.has_rank
+        highlight_field = first_search.highlight_field
+
+        # Build the aligned union
+        union_qs: IndexQuerySet | AlignedUnionQuerySet = first_search.qs
+        for s, model in self.searches[1:]:
+            union_qs = union_qs.aligned_union(s.qs)
+
+        # Per-model lookup: field_names and model identity vary across indexes
+        ct_map: dict[str, _CtInfo] = {
+            get_model_ct(model): {
+                "model": model,
+                "field_names": _field_names(s.index),
+            }
+            for s, model in self.searches
+        }
+
+        # Ordering — always include tiebreakers for stable pagination
+        if sort_by:
+            ordered_qs = union_qs.order_by(*sort_by, "django_ct", "django_id")
+        else:
+            ordered_qs = union_qs.order_by("-rank", "django_ct", "django_id")
+
+        # Pagination
+        if end_offset is not None:
+            ordered_qs = ordered_qs[start_offset:end_offset]
+        elif start_offset:
+            ordered_qs = ordered_qs[start_offset:]
+
+        # Materialize
+        results = []
+        for row in ordered_qs:
+            info = ct_map[row["django_ct"]]
+            model = info["model"]
+
+            stored_fields = {fn: row.get(fn) for fn in info["field_names"]}
+
+            if highlight_field and "headline" in row and row["headline"]:
+                stored_fields["highlighted"] = {highlight_field: [row["headline"]]}
+
+            rank = row.get(score_field)
+            score = float(rank) if has_rank and rank is not None else 0
+
+            results.append(
+                result_class(
+                    model._meta.app_label,
+                    model._meta.model_name,
+                    row["django_id"],
+                    score,
+                    **stored_fields,
                 )
             )
         return results
@@ -366,30 +568,18 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
             log.exception("Failed to clear index")
 
     @log_query
-    def search(self, query_string, **kwargs):
+    def search(self, query_string: str, **kwargs: Any) -> SearchResponse:
         if not query_string or not query_string.strip():
-            return {"results": [], "hits": 0}
+            return {"results": [], "hits": 0, "spelling_suggestion": None}
 
         try:
             ui = connections["default"].get_unified_index()
 
-            models = kwargs.get("models")
-            if models:
-                if len(models) > 1:
-                    raise NotImplementedError(
-                        "postgres_fts_backend does not support searching multiple models at once. "
-                        "Use .models(MyModel) to search a single model."
-                    )
-                (model,) = models
-                index = ui.get_index(model)
+            requested_models = kwargs.get("models")
+            if requested_models:
+                model_index_pairs = [(m, ui.get_index(m)) for m in requested_models]
             else:
-                indexes = ui.get_indexes()
-                if len(indexes) > 1:
-                    raise NotImplementedError(
-                        "postgres_fts_backend does not support searching multiple models at once. "
-                        "Use .models(MyModel) to search a single model."
-                    )
-                ((model, index),) = indexes.items()
+                model_index_pairs = list(ui.get_indexes().items())
 
             orm_query = kwargs.pop("orm_query", None)
 
@@ -402,49 +592,72 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
                 else None
             )
 
-            index_model = get_index_model(model)
-            if orm_query is not None:
-                s = IndexSearch.from_orm_query(
-                    index_model, index, self.search_config, orm_query
+            # Build IndexSearch per model
+            searches = []
+            for model, index in model_index_pairs:
+                index_model = get_index_model(model)
+                if orm_query is not None:
+                    s = IndexSearch.from_orm_query(
+                        index_model, index, self.search_config, orm_query
+                    )
+                else:
+                    s = IndexSearch.from_query_string(
+                        index_model, index, self.search_config, query_string
+                    )
+
+                if narrow_queries := kwargs.get("narrow_queries"):
+                    s.narrow(narrow_queries)
+                if boost := kwargs.get("boost"):
+                    s.boost(boost)
+                if kwargs.get("highlight"):
+                    s.highlight()
+
+                searches.append((s, model))
+
+            if len(searches) == 1:
+                # Single-model path (no behavior change)
+                s, model = searches[0]
+                total_count = s.count()
+                facets = s.facets(
+                    facets=kwargs.get("facets"),
+                    date_facets=kwargs.get("date_facets"),
+                    query_facets=kwargs.get("query_facets"),
                 )
+                results = s.results(sort_by, start_offset, end_offset, result_class)
             else:
-                s = IndexSearch.from_query_string(
-                    index_model, index, self.search_config, query_string
+                # Multi-model path
+                multi = MultiIndexSearch(searches)
+                total_count = multi.count()
+                facets = multi.facets(
+                    facets=kwargs.get("facets"),
+                    date_facets=kwargs.get("date_facets"),
+                    query_facets=kwargs.get("query_facets"),
                 )
+                results = multi.results(sort_by, start_offset, end_offset, result_class)
 
-            if narrow_queries := kwargs.get("narrow_queries"):
-                s.narrow(narrow_queries)
-            if boost := kwargs.get("boost"):
-                s.boost(boost)
-            if kwargs.get("highlight"):
-                s.highlight()
-
-            total_count = s.count()
-            facets = s.facets(
-                facets=kwargs.get("facets"),
-                date_facets=kwargs.get("date_facets"),
-                query_facets=kwargs.get("query_facets"),
-            )
-            results = s.results(sort_by, start_offset, end_offset, result_class)
-
-            result = {
+            response: SearchResponse = {
                 "results": results,
                 "hits": total_count,
                 "spelling_suggestion": None,
             }
             if facets:
-                result["facets"] = facets
-            return result
+                response["facets"] = facets
+            return response
         except DatabaseError:
             if not self.silently_fail:
                 raise
             log.exception("Failed to search with query '%s'", query_string)
-            return {"results": [], "hits": 0}
+            return {"results": [], "hits": 0, "spelling_suggestion": None}
 
-    def prep_value(self, value):
+    def prep_value(self, value: Any) -> Any:
         return value
 
-    def more_like_this(self, model_instance, additional_query_string=None, **kwargs):
+    def more_like_this(
+        self,
+        model_instance: models.Model,
+        additional_query_string: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         raise NotImplementedError(
             "postgres_fts_backend does not support more_like_this. "
             "PostgreSQL has no native document similarity feature."
