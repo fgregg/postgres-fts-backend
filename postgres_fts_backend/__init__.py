@@ -1,11 +1,18 @@
-"""
-A ORM-based backend for Postgres FTS search \.
-"""
+import logging
+import re
+import warnings
 
-from warnings import warn
-
-from django.contrib.postgres.search import SearchQuery
-from django.db.models import Q
+from django.apps import apps as django_apps
+from django.contrib.postgres.search import (
+    SearchHeadline,
+    SearchQuery,
+    SearchRank,
+    SearchVector,
+)
+from django.db import DatabaseError, connection
+from django.db.models import Count, F, Q
+from django.db.models.functions import Trunc
+from django.utils.encoding import force_str
 from haystack import connections
 from haystack.backends import (
     BaseEngine,
@@ -14,159 +21,430 @@ from haystack.backends import (
     SearchNode,
     log_query,
 )
-from haystack.constants import DEFAULT_ALIAS
-from haystack.inputs import Clean, PythonData
+from haystack.constants import DJANGO_CT, DJANGO_ID
 from haystack.models import SearchResult
-from haystack.utils import get_model_ct_tuple
+from haystack.utils import get_model_ct
+
+from postgres_fts_backend.models import generate_index_models, get_index_model
+
+default_app_config = "postgres_fts_backend.apps.PostgresFTSConfig"
+
+log = logging.getLogger("haystack")
+
+
+def _table_name(model):
+    return f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
+
+
+def validate_all_schemas():
+    """Validate all index tables at startup. Called from AppConfig.ready()."""
+    ui = connections["default"].get_unified_index()
+    existing_tables = connection.introspection.table_names()
+
+    for model, index in ui.get_indexes().items():
+        table = _table_name(model)
+
+        if table not in existing_tables:
+            raise RuntimeError(
+                f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
+                "then 'manage.py migrate postgres_fts_backend'."
+            )
+
+        expected_columns = {"id", "django_id", "django_ct", "search_vector"}
+        for field_name in index.fields:
+            if field_name not in ("django_ct", "django_id"):
+                expected_columns.add(field_name)
+
+        with connection.cursor() as cursor:
+            db_columns = {
+                info.name
+                for info in connection.introspection.get_table_description(
+                    cursor, table
+                )
+            }
+
+        missing = expected_columns - db_columns
+        if missing:
+            warnings.warn(
+                "Index table '{}' schema is out of date (missing columns: {}). "
+                "Run 'manage.py build_postgres_schema' then "
+                "'manage.py migrate postgres_fts_backend'.".format(
+                    table, ", ".join(sorted(missing))
+                )
+            )
+
+
+def _field_names(index):
+    return [name for name in index.fields if name not in ("django_ct", "django_id")]
+
+
+def _resolve_field_name(field_name):
+    if field_name.endswith("_exact"):
+        return field_name[:-6]
+    return field_name
+
+
+def _parse_narrow_query(query_string):
+    match = re.match(r'^(\w+):"(.+)"$', query_string)
+    if not match:
+        raise ValueError(f"Cannot parse narrow query: '{query_string}'")
+    return match.group(1), match.group(2)
+
+
+class IndexSearch:
+    def __init__(self, qs, index, search_config, has_rank=False, search_text=None):
+        self.qs = qs
+        self.index = index
+        self.search_config = search_config
+        self.has_rank = has_rank
+        self.search_text = search_text
+        self.score_field = "rank"
+        self.highlight_field = None
+
+    @classmethod
+    def from_query_string(cls, index_model, index, search_config, query_string):
+        if query_string == "*":
+            return cls(index_model.objects.all(), index, search_config)
+
+        if ":" in query_string and not query_string.startswith('"'):
+            field, _, value = query_string.partition(":")
+            content_field = index.get_content_field()
+            if field == content_field:
+                return cls(
+                    index_model.objects.search(value, config=search_config),
+                    index,
+                    search_config,
+                    has_rank=True,
+                    search_text=value,
+                )
+            return cls(
+                index_model.objects.filter(**{field: value}),
+                index,
+                search_config,
+            )
+
+        return cls(
+            index_model.objects.search(query_string, config=search_config),
+            index,
+            search_config,
+            has_rank=True,
+            search_text=query_string,
+        )
+
+    @classmethod
+    def from_orm_query(cls, index_model, index, search_config, orm_query):
+        content_search_text = orm_query.content_search_text
+        qs = index_model.objects.filter(orm_query)
+        if content_search_text:
+            qs = qs.ranked(content_search_text, config=search_config)
+        return cls(
+            qs,
+            index,
+            search_config,
+            has_rank=bool(content_search_text),
+            search_text=content_search_text,
+        )
+
+    def narrow(self, narrow_queries):
+        for nq in narrow_queries:
+            field, value = _parse_narrow_query(nq)
+            col = _resolve_field_name(field)
+            self.qs = self.qs.filter(**{col: value})
+
+    def highlight(self):
+        if self.search_text is None:
+            return self
+        content_field = self.index.get_content_field()
+        sq = SearchQuery(
+            self.search_text, search_type="websearch", config=self.search_config
+        )
+        self.qs = self.qs.annotate(
+            headline=SearchHeadline(content_field, sq, config=self.search_config)
+        )
+        self.highlight_field = content_field
+
+    def boost(self, boost_dict):
+        if not self.has_rank or not boost_dict:
+            return self
+        annotations = {}
+        combined = F("rank")
+        for i, (term, weight) in enumerate(boost_dict.items()):
+            alias = f"_boost_{i}"
+            bq = SearchQuery(term, search_type="websearch", config=self.search_config)
+            annotations[alias] = SearchRank(
+                "search_vector", bq, cover_density=True, normalization=32
+            )
+            combined = combined * (1.0 + F(alias) * weight)
+        annotations["_boosted_rank"] = combined
+        self.qs = self.qs.annotate(**annotations)
+        self.score_field = "_boosted_rank"
+
+    def count(self):
+        return self.qs.count()
+
+    def facets(self, facets=None, date_facets=None, query_facets=None):
+        result = {}
+
+        if facets:
+            result["fields"] = {}
+            for field_name in facets:
+                col = _resolve_field_name(field_name)
+                facet_qs = (
+                    self.qs.values(col)
+                    .annotate(count=Count("id"))
+                    .order_by("-count", col)
+                )
+                result["fields"][field_name] = [
+                    (row[col], row["count"]) for row in facet_qs
+                ]
+
+        if date_facets:
+            result["dates"] = {}
+            for field_name, facet_opts in date_facets.items():
+                col = _resolve_field_name(field_name)
+                gap_by = facet_opts["gap_by"]
+                start_date = facet_opts["start_date"]
+                end_date = facet_opts["end_date"]
+                facet_qs = (
+                    self.qs.filter(
+                        **{
+                            f"{col}__gte": start_date,
+                            f"{col}__lt": end_date,
+                        }
+                    )
+                    .annotate(bucket=Trunc(col, gap_by))
+                    .values("bucket")
+                    .annotate(count=Count("id"))
+                    .order_by("bucket")
+                )
+                result["dates"][field_name] = [
+                    (row["bucket"], row["count"]) for row in facet_qs
+                ]
+
+        if query_facets:
+            result["queries"] = {}
+            for field_name, value in query_facets:
+                col = _resolve_field_name(field_name)
+                count = self.qs.filter(**{col: value}).count()
+                result["queries"][f"{field_name}_{value}"] = count
+
+        return result
+
+    def results(
+        self, sort_by=None, start_offset=0, end_offset=None, result_class=SearchResult
+    ):
+        qs = self.qs
+
+        # Ordering
+        if sort_by:
+            qs = qs.order_by(*sort_by)
+        elif self.has_rank:
+            qs = qs.order_by(f"-{self.score_field}")
+
+        # Pagination
+        if end_offset is not None:
+            qs = qs[start_offset:end_offset]
+        elif start_offset:
+            qs = qs[start_offset:]
+
+        # Materialize
+        model = self.index.get_model()
+        field_names = _field_names(self.index)
+        app_label = model._meta.app_label
+        model_name = model._meta.model_name
+
+        results = []
+        for obj in qs:
+            stored_fields = {fn: getattr(obj, fn) for fn in field_names}
+            if self.highlight_field:
+                headline = getattr(obj, "headline", None)
+                if headline:
+                    stored_fields["highlighted"] = {self.highlight_field: [headline]}
+            rank = getattr(obj, self.score_field, None)
+            score = float(rank) if self.has_rank and rank is not None else 0
+            results.append(
+                result_class(
+                    app_label, model_name, obj.django_id, score, **stored_fields
+                )
+            )
+        return results
 
 
 class PostgresFTSSearchBackend(BaseSearchBackend):
-    def update(self, indexer, iterable, commit=True):
-        warn("update is not implemented in this backend")
+    def __init__(self, connection_alias, **connection_options):
+        super().__init__(connection_alias, **connection_options)
+        self.search_config = connection_options.get("SEARCH_CONFIG", "english")
 
-    def remove(self, obj, commit=True):
-        warn("remove is not implemented in this backend")
+    def build_schema(self, fields):
+        return generate_index_models()
+
+    def update(self, index, iterable, commit=True):
+        try:
+            model = index.get_model()
+            index_model = get_index_model(model)
+            field_names = _field_names(index)
+            content_field = index.get_content_field()
+
+            rows = []
+            for obj in iterable:
+                prepared = index.full_prepare(obj)
+                defaults = {fn: prepared.get(fn) for fn in field_names}
+                rows.append(
+                    index_model(
+                        django_ct=prepared[DJANGO_CT],
+                        django_id=prepared[DJANGO_ID],
+                        **defaults,
+                    )
+                )
+
+            if rows:
+                index_model.objects.bulk_create(
+                    rows,
+                    update_conflicts=True,
+                    unique_fields=["django_ct", "django_id"],
+                    update_fields=field_names,
+                )
+                index_model.objects.filter(
+                    django_ct=get_model_ct(model),
+                    django_id__in=[r.django_id for r in rows],
+                ).update(
+                    search_vector=SearchVector(content_field, config=self.search_config)
+                )
+        except DatabaseError:
+            if not self.silently_fail:
+                raise
+            log.exception("Failed to update index for %s", index)
+
+    def remove(self, obj_or_string, commit=True):
+        try:
+            if isinstance(obj_or_string, str):
+                # String format: "app_label.model_name.pk"
+                parts = obj_or_string.split(".", 2)
+                if len(parts) != 3:
+                    raise ValueError(
+                        "String identifier must be 'app_label.model_name.pk', "
+                        f"got '{obj_or_string}'"
+                    )
+                model = django_apps.get_model(parts[0], parts[1])
+                django_ct = get_model_ct(model)
+                django_id = parts[2]
+            else:
+                model = type(obj_or_string)
+                django_ct = get_model_ct(model)
+                django_id = force_str(obj_or_string.pk)
+
+            index_model = get_index_model(model)
+            index_model.objects.filter(
+                django_ct=django_ct, django_id=django_id
+            ).delete()
+        except DatabaseError:
+            if not self.silently_fail:
+                raise
+            log.exception("Failed to remove document '%s'", obj_or_string)
 
     def clear(self, models=None, commit=True):
-        warn("clear is not implemented in this backend")
+        try:
+            if models is None:
+                ui = connections["default"].get_unified_index()
+                models = ui.get_indexes().keys()
+
+            for model in models:
+                index_model = get_index_model(model)
+                index_model.objects.all().delete()
+        except DatabaseError:
+            if not self.silently_fail:
+                raise
+            log.exception("Failed to clear index")
 
     @log_query
-    def search(self, orm_query, **kwargs):
-        hits = 0
-        results = []
-        result_class = SearchResult
+    def search(self, query_string, **kwargs):
+        if not query_string or not query_string.strip():
+            return {"results": [], "hits": 0}
+
         try:
-            (model,) = (
-                connections[self.connection_alias]
-                .get_unified_index()
-                .get_indexed_models()
+            ui = connections["default"].get_unified_index()
+
+            models = kwargs.get("models")
+            if models:
+                if len(models) > 1:
+                    raise NotImplementedError(
+                        "postgres_fts_backend does not support searching multiple models at once. "
+                        "Use .models(MyModel) to search a single model."
+                    )
+                (model,) = models
+                index = ui.get_index(model)
+            else:
+                indexes = ui.get_indexes()
+                if len(indexes) > 1:
+                    raise NotImplementedError(
+                        "postgres_fts_backend does not support searching multiple models at once. "
+                        "Use .models(MyModel) to search a single model."
+                    )
+                ((model, index),) = indexes.items()
+
+            orm_query = kwargs.pop("orm_query", None)
+
+            result_class = kwargs.get("result_class", SearchResult)
+            sort_by = kwargs.get("sort_by")
+            start_offset = int(kwargs.get("start_offset", 0))
+            end_offset = (
+                int(kwargs["end_offset"])
+                if kwargs.get("end_offset") is not None
+                else None
             )
-        except ValueError:
-            raise NotImplementedError(
-                "The Postgres FTS backend does not currently searching across"
-                "more than one model"
+
+            index_model = get_index_model(model)
+            if orm_query is not None:
+                s = IndexSearch.from_orm_query(
+                    index_model, index, self.search_config, orm_query
+                )
+            else:
+                s = IndexSearch.from_query_string(
+                    index_model, index, self.search_config, query_string
+                )
+
+            if narrow_queries := kwargs.get("narrow_queries"):
+                s.narrow(narrow_queries)
+            if boost := kwargs.get("boost"):
+                s.boost(boost)
+            if kwargs.get("highlight"):
+                s.highlight()
+
+            total_count = s.count()
+            facets = s.facets(
+                facets=kwargs.get("facets"),
+                date_facets=kwargs.get("date_facets"),
+                query_facets=kwargs.get("query_facets"),
             )
+            results = s.results(sort_by, start_offset, end_offset, result_class)
 
-        if kwargs.get("result_class"):
-            result_class = kwargs["result_class"]
+            result = {
+                "results": results,
+                "hits": total_count,
+                "spelling_suggestion": None,
+            }
+            if facets:
+                result["facets"] = facets
+            return result
+        except DatabaseError:
+            if not self.silently_fail:
+                raise
+            log.exception("Failed to search with query '%s'", query_string)
+            return {"results": [], "hits": 0}
 
-        if kwargs.get("models"):
-            (model,) = kwargs["models"]
-
-        qs = model.objects.filter(orm_query)
-
-        hits += len(qs)
-
-        for match in qs:
-            match.__dict__.pop("score", None)
-            app_label, model_name = get_model_ct_tuple(match)
-            result = result_class(app_label, model_name, match.pk, 0, **match.__dict__)
-            # For efficiency.
-            result._model = match.__class__
-            result._object = match
-            results.append(result)
-
-        return {"results": results, "hits": hits}
-
-    def prep_value(self, db_field, value):
+    def prep_value(self, value):
         return value
 
-    def more_like_this(
-        self,
-        model_instance,
-        additional_query_string=None,
-        start_offset=0,
-        end_offset=None,
-        limit_to_registered_models=None,
-        result_class=None,
-        **kwargs,
-    ):
-        return {"results": [], "hits": 0}
+    def more_like_this(self, model_instance, additional_query_string=None, **kwargs):
+        raise NotImplementedError(
+            "postgres_fts_backend does not support more_like_this. "
+            "PostgreSQL has no native document similarity feature."
+        )
 
 
-class PostgresFTSSearchQuery(BaseSearchQuery):
-
-    def __init__(self, using=DEFAULT_ALIAS):
-        super().__init__(using)
-        self.query_filter = PostgresSearchNode()
-
-    def build_query_fragment(self, field, filter_type, value):
-
-        if not hasattr(value, "input_type_name"):
-            # Handle when we've got a ``ValuesListQuerySet``...
-            if hasattr(value, "values_list"):
-                value = list(value)
-
-            if isinstance(value, str):
-                # It's not an ``InputType``. Assume ``Clean``.
-                value = Clean(value)
-            else:
-                value = PythonData(value)
-
-        prepared_value = value.prepare(self)
-
-        unified_index = connections[self._using].get_unified_index()
-
-        if field == "content":
-            model_field = unified_index.fields[unified_index.document_field].model_attr
-        else:
-            try:
-                model_field = unified_index.fields[field].model_attr
-            except KeyError:
-                raise ValueError(f"{field} is not an indexed field.")
-
-        if filter_type == "content":
-            search_string = SearchQuery(prepared_value, search_type="websearch")
-        else:
-            search_string = prepared_value
-
-        return Q(**{f"{model_field}__search": search_string})
-
-    def build_query(self):
-        """
-        Interprets the collected query metadata and builds the final query to
-        be sent to the backend.
-        """
-        unified_index = connections[self._using].get_unified_index()
-
-        if len(unified_index.indexes) > 1:
-            raise NotImplementedError(
-                "The Postgres FTS backend does not currently searching across"
-                "more than one model"
-            )
-
-        final_query = self.query_filter.as_orm_query(self.build_query_fragment)
-
-        if not final_query:
-            # Match all.
-            final_query = self.matching_all_fragment()
-
-        if self.boost:
-            boost_list = []
-
-            for boost_word, boost_value in self.boost.items():
-                boost_list.append(self.boost_fragment(boost_word, boost_value))
-
-            final_query = "%s %s" % (final_query, " ".join(boost_list))
-
-        return final_query
-
-    def matching_all_fragment(self):
-
-        return Q()
-
-    def build_not_query(self, query_string):
-        if " " in query_string:
-            query_string = "(%s)" % query_string
-
-        return "-%s" % query_string
-
-
-class PostgresSearchNode(SearchNode):
-
+class ORMSearchNode(SearchNode):
     def as_orm_query(self, query_fragment_callback):
         result = []
-
         for child in self.children:
             if hasattr(child, "as_orm_query"):
                 result.append(child.as_orm_query(query_fragment_callback))
@@ -183,13 +461,88 @@ class PostgresSearchNode(SearchNode):
             for subquery in result:
                 query |= subquery
 
-        if query:
-            if self.negated:
-                query = ~query
+        if query and self.negated:
+            query = ~query
 
         return query
 
 
+class ORMSearchQuery(BaseSearchQuery):
+
+    def __init__(self, using="default"):
+        super().__init__(using=using)
+        self.query_filter = ORMSearchNode()
+        self.content_search_text = None
+
+    def clean(self, query_fragment):
+        return query_fragment
+
+    def build_query_fragment(self, field, filter_type, value):
+        if hasattr(value, "prepare"):
+            value = value.prepare(self)
+
+        if filter_type == "content":
+            if field == "content":
+                self.content_search_text = value
+                return Q(
+                    search_vector=SearchQuery(
+                        value,
+                        search_type="websearch",
+                        config=self.backend.search_config,
+                    )
+                )
+            return Q(**{f"{field}__trigram_similar": value})
+
+        if filter_type == "fuzzy":
+            return Q(**{f"{field}__trigram_similar": value})
+
+        if filter_type == "in":
+            value = list(value)
+            if not value:
+                return Q(pk__in=[])
+        elif filter_type == "range":
+            value = (value[0], value[1])
+
+        # contains/startswith/endswith → case-insensitive Django lookups
+        lookup = {
+            "contains": "icontains",
+            "startswith": "istartswith",
+            "endswith": "iendswith",
+        }.get(filter_type, filter_type)
+
+        return Q(**{f"{field}__{lookup}": value})
+
+    def build_query(self):
+        final_query = self.query_filter.as_orm_query(self.build_query_fragment)
+        if not final_query:
+            return Q()
+        return final_query
+
+    def matching_all_fragment(self):
+        return Q()
+
+    def run(self, spelling_query=None, **kwargs):
+        final_query = self.build_query()
+        search_kwargs = self.build_params(spelling_query=spelling_query)
+
+        if kwargs:
+            search_kwargs.update(kwargs)
+
+        final_query.content_search_text = self.content_search_text
+        search_kwargs["orm_query"] = final_query
+
+        results = self.backend.search("*", **search_kwargs)
+        self._results = results.get("results", [])
+        self._hit_count = results.get("hits", 0)
+        self._facet_counts = self.post_process_facets(results)
+        self._spelling_suggestion = results.get("spelling_suggestion", None)
+
+    def get_count(self):
+        if self._hit_count is None:
+            self.run()
+        return self._hit_count
+
+
 class PostgresFTSEngine(BaseEngine):
     backend = PostgresFTSSearchBackend
-    query = PostgresFTSSearchQuery
+    query = ORMSearchQuery

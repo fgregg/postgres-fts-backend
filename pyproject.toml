@@ -5,25 +5,15 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "postgres-fts-backend"
 version = "0.0.0"
-dependencies = [
-        'django>=5.0',
-        'django-haystack>=2.8.0',
-        ]
+dependencies = ['django>=5.0', 'django-haystack>=2.8.0']
 requires-python = ">= 3.8"
-authors = [{name = "Forest Gregg", email = "fgregg@datamade.us" }]
+authors = [{ name = "Forest Gregg", email = "fgregg@datamade.us" }]
 description = "A PostgreSQL Full Text Seach Backend for Haystack"
 readme = "README.md"
-classifiers = [
-  "License :: OSI Approved :: MIT License",
-  ]
+classifiers = ["License :: OSI Approved :: MIT License"]
 
 [project.optional-dependencies]
-dev = ["pytest",
-       "black",
-       "isort",
-       "ruff",
-       "pre-commit",
-]
+dev = ["pytest", "pytest-django", "black", "isort", "ruff", "pre-commit"]
 
 
 [project.urls]
@@ -31,5 +21,27 @@ Repository = "https://github.com/datamade/postgres-fts-backend"
 Issues = "https://github.com/datamade/postgres-fts-backend/issues"
 Changelog = "https://github.com/datamade/postgres-fts-backend/blob/main/CHANGELOG.md"
 
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+
 [tool.setuptools]
 packages = ["postgres_fts_backend"]
+
+[tool.ruff]
+# Optionally set target Python version and line length for consistency
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = [
+  "E",   # pycodestyle errors
+  "F",   # pyflakes
+  "I",   # isort (import sorting)
+  "UP",  # pyupgrade (modernize code)
+  "DJ",  # Django rules (flake8-django),
+  "PLC", # Pylint conventions
+  "PT",  # pytest rules
+]
+ignore = [
+  "E501", # Ignore line length violations (if you prefer an auto-formatter to handle it)
+]
