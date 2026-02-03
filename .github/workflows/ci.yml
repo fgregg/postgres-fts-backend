@@ -15,7 +15,6 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: ruff check postgres_fts_backend/ tests/
       - run: black --check .
-      - run: mypy postgres_fts_backend/
 
   test:
     runs-on: ${{ matrix.os }}
@@ -34,6 +33,7 @@ jobs:
           password: postgres
           database: haystack_tests
       - run: pip install -e ".[dev]" "psycopg[binary]"
+      - run: mypy postgres_fts_backend/
       - run: pytest
         env:
           PGHOST: localhost
