@@ -87,8 +87,3 @@ ALTER DATABASE mydb SET pg_trgm.similarity_threshold = 0.5;
 PostgreSQL FTS doesn't provide any facilities for this. It could be done, but I just need to think more about it.
 
 ### `spelling_suggestions` are not supported
-
-
-## License
-
-MIT
