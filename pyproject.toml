@@ -13,7 +13,7 @@ readme = "README.md"
 classifiers = ["License :: OSI Approved :: MIT License"]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-django", "black", "isort", "ruff", "pre-commit"]
+dev = ["pytest", "pytest-django", "ruff", "black"]
 
 
 [project.urls]
