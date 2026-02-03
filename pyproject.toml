@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "postgres-fts-backend"
-version = "0.0.0"
+version = "0.0.1"
 dependencies = ['django>=5.0', 'django-haystack>=2.8.0']
 requires-python = ">= 3.12"
 authors = [{ name = "Forest Gregg", email = "fgregg@datamade.us" }]
