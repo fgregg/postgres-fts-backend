@@ -962,13 +962,12 @@ class TestSchemaValidation(TestCase):
         backend_teardown(self)
 
     def test_validate_schema_missing_table(self):
-        """_validate_all_schemas should raise RuntimeError for a missing table."""
+        """_validate_all_schemas should warn for a missing table."""
         with patch(
             "postgres_fts_backend._table_name", return_value="nonexistent_table_xyz"
         ):
-            with pytest.raises(RuntimeError) as ctx:
+            with pytest.warns(UserWarning, match="does not exist"):
                 validate_all_schemas()
-            assert "does not exist" in str(ctx.value)
 
 
 # ---------------------------------------------------------------------------
