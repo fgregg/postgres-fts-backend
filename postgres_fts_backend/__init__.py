@@ -38,17 +38,26 @@ def _table_name(model):
 
 def validate_all_schemas():
     """Validate all index tables at startup. Called from AppConfig.ready()."""
-    ui = connections["default"].get_unified_index()
-    existing_tables = connection.introspection.table_names()
+    try:
+        ui = connections["default"].get_unified_index()
+        existing_tables = connection.introspection.table_names()
+    except Exception:
+        warnings.warn(
+            "Could not connect to database to validate index schemas. "
+            "Run 'manage.py build_postgres_schema' then "
+            "'manage.py migrate postgres_fts_backend' once the database is available."
+        )
+        return
 
     for model, index in ui.get_indexes().items():
         table = _table_name(model)
 
         if table not in existing_tables:
-            raise RuntimeError(
+            warnings.warn(
                 f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
                 "then 'manage.py migrate postgres_fts_backend'."
             )
+            continue
 
         expected_columns = {"id", "django_id", "django_ct", "search_vector"}
         for field_name in index.fields:
