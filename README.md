@@ -5,7 +5,7 @@ PostgreSQL's built-in full-text search. No external search service required.
 
 ## Requirements
 
-- Python >= 3.8
+- Python >= 3.12
 - Django >= 5.0
 - django-haystack >= 2.8.0
 - PostgreSQL
