@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "postgres-fts-backend"
 version = "0.0.0"
 dependencies = ['django>=5.0', 'django-haystack>=2.8.0']
-requires-python = ">= 3.8"
+requires-python = ">= 3.12"
 authors = [{ name = "Forest Gregg", email = "fgregg@datamade.us" }]
 description = "A PostgreSQL Full Text Seach Backend for Haystack"
 readme = "README.md"
@@ -17,9 +17,8 @@ dev = ["pytest", "pytest-django", "ruff", "black"]
 
 
 [project.urls]
-Repository = "https://github.com/datamade/postgres-fts-backend"
-Issues = "https://github.com/datamade/postgres-fts-backend/issues"
-Changelog = "https://github.com/datamade/postgres-fts-backend/blob/main/CHANGELOG.md"
+Repository = "https://github.com/fgregg/postgres-fts-backend"
+Issues = "https://github.com/fgregg/postgres-fts-backend/issues"
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "tests.settings"
