@@ -12,7 +12,7 @@ from django.contrib.postgres.search import (
     SearchRank,
     SearchVector,
 )
-from django.core.exceptions import FieldDoesNotExist
+from django.core.exceptions import FieldDoesNotExist, FieldError
 from django.db import DatabaseError, connection, models
 from django.db.models import Count, F, FloatField, Q, Value
 from django.db.models.functions import Trunc
@@ -122,10 +122,10 @@ def _resolve_field_name(field_name: str) -> str:
     return field_name
 
 
-def _parse_narrow_query(query_string: str) -> tuple[str, str]:
+def _parse_narrow_query(query_string: str) -> tuple[str, str] | None:
     match = re.match(r'^(\w+):"(.+)"$', query_string)
     if not match:
-        raise ValueError(f"Cannot parse narrow query: '{query_string}'")
+        return None
     return match.group(1), match.group(2)
 
 
@@ -162,19 +162,25 @@ class IndexSearch:
 
         if ":" in query_string and not query_string.startswith('"'):
             field, _, value = query_string.partition(":")
-            content_field = index.get_content_field()
-            if field == content_field:
-                return cls(
-                    index_model.objects.search(value, config=search_config),  # type: ignore[attr-defined]
-                    index,
-                    search_config,
-                    has_rank=True,
-                    search_text=value,
-                )
-            qs = index_model.objects.filter(**{field: value}).annotate(  # type: ignore[attr-defined]
-                rank=Value(0, output_field=FloatField())
-            )
-            return cls(qs, index, search_config)
+            if field:
+                content_field = index.get_content_field()
+                if field == content_field:
+                    return cls(
+                        index_model.objects.search(value, config=search_config),  # type: ignore[attr-defined]
+                        index,
+                        search_config,
+                        has_rank=True,
+                        search_text=value,
+                    )
+                try:
+                    index_model._meta.get_field(field)
+                except FieldDoesNotExist:
+                    pass  # Fall through to full-text search
+                else:
+                    qs = index_model.objects.filter(**{field: value}).annotate(  # type: ignore[attr-defined]
+                        rank=Value(0, output_field=FloatField())
+                    )
+                    return cls(qs, index, search_config)
 
         return cls(
             index_model.objects.search(query_string, config=search_config),  # type: ignore[attr-defined]
@@ -193,7 +199,12 @@ class IndexSearch:
         orm_query: Q,
     ) -> IndexSearch:
         content_search_text = orm_query.content_search_text  # type: ignore[attr-defined]
-        qs = index_model.objects.filter(orm_query)  # type: ignore[attr-defined]
+        try:
+            qs = index_model.objects.filter(orm_query)  # type: ignore[attr-defined]
+        except FieldError:
+            # The Q object references fields that don't exist on this model's
+            # index table (e.g. cross-model search with model-specific fields).
+            qs = index_model.objects.none()  # type: ignore[attr-defined]
         if content_search_text:
             qs = qs.ranked(content_search_text, config=search_config)
         else:
@@ -208,7 +219,11 @@ class IndexSearch:
 
     def narrow(self, narrow_queries: list[str]) -> None:
         for nq in narrow_queries:
-            field, value = _parse_narrow_query(nq)
+            parsed = _parse_narrow_query(nq)
+            if parsed is None:
+                self.qs = self.qs.none()
+                return
+            field, value = parsed
             col = _resolve_field_name(field)
             try:
                 self.qs.model._meta.get_field(col)
@@ -331,6 +346,8 @@ class IndexSearch:
         results = []
         for obj in qs:
             stored_fields = {fn: getattr(obj, fn) for fn in field_names}
+            # 'score' is a reserved positional arg of SearchResult.__init__
+            stored_fields.pop("score", None)
             if self.highlight_field:
                 headline = getattr(obj, "headline", None)
                 if headline:
@@ -462,6 +479,8 @@ class MultiIndexSearch:
             model = info["model"]
 
             stored_fields = {fn: row.get(fn) for fn in info["field_names"]}
+            # 'score' is a reserved positional arg of SearchResult.__init__
+            stored_fields.pop("score", None)
 
             if highlight_field and "headline" in row and row["headline"]:
                 stored_fields["highlighted"] = {highlight_field: [row["headline"]]}
@@ -482,6 +501,12 @@ class MultiIndexSearch:
 
 
 class PostgresFTSSearchBackend(BaseSearchBackend):
+    # websearch_to_tsquery operators. OR is stripped by clean() since
+    # there is no escape mechanism. Negation (-) and phrase quotes ("...")
+    # are handled natively and don't need escaping.
+    RESERVED_WORDS = ("OR",)
+    RESERVED_CHARACTERS = ()
+
     def __init__(self, connection_alias, **connection_options):
         super().__init__(connection_alias, **connection_options)
         self.search_config = connection_options.get("SEARCH_CONFIG", "english")
@@ -697,7 +722,15 @@ class ORMSearchQuery(BaseSearchQuery):
         self.content_search_text = None
 
     def clean(self, query_fragment):
-        return query_fragment
+        if not isinstance(query_fragment, str):
+            return query_fragment
+
+        words = query_fragment.split()
+        cleaned_words = [w for w in words if w.upper() not in self.backend.RESERVED_WORDS]
+        return " ".join(cleaned_words)
+
+    def build_not_query(self, query_string):
+        return "-%s" % query_string
 
     def build_query_fragment(self, field, filter_type, value):
         if hasattr(value, "prepare"):

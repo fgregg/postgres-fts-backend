@@ -18,6 +18,7 @@ from django.db.models import FloatField, Value
 from django.test import TestCase, override_settings
 from haystack import connections
 from haystack import indexes as haystack_indexes
+from haystack.inputs import AutoQuery
 from haystack.query import SQ, RelatedSearchQuerySet, SearchQuerySet
 from haystack.utils.loading import UnifiedIndex
 
@@ -414,15 +415,15 @@ class TestFieldValidation(TestCase):
     def tearDown(self):
         backend_teardown(self)
 
-    def test_search_rejects_unknown_field(self):
-        """Searching field:value with a non-existent field should raise FieldError."""
-        with pytest.raises(FieldError):
-            self.backend.search("nonexistent_field:foo")
+    def test_search_unknown_field_falls_through_to_fts(self):
+        """Searching field:value with a non-existent field falls through to full-text search."""
+        result = self.backend.search("nonexistent_field:foo")
+        assert isinstance(result["hits"], int)
 
-    def test_filter_rejects_unknown_field(self):
-        """Filtering on a non-existent field should raise FieldError."""
-        with pytest.raises(FieldError):
-            list(SearchQuerySet().filter(nonexistent_field__exact="foo"))
+    def test_filter_unknown_field_returns_empty(self):
+        """Filtering on a non-existent field returns empty results."""
+        sqs = SearchQuerySet().filter(nonexistent_field__exact="foo")
+        assert len(sqs) == 0
 
     def test_order_by_rejects_unknown_field(self):
         """Ordering by a non-existent field should raise FieldError."""
@@ -825,6 +826,125 @@ class TestSearchQuerySet(TestCase):
         for result in combined:
             obj = MockModel.objects.get(pk=result.pk)
             assert obj.author in ["daniel1", "daniel2"]
+
+
+# ---------------------------------------------------------------------------
+# AutoQuery behavior
+# ---------------------------------------------------------------------------
+
+
+class TestAutoQueryPrepare(TestCase):
+    """Tests that AutoQuery.prepare() produces correct websearch_to_tsquery input.
+
+    The ORMSearchQuery overrides clean() to strip reserved words (OR) and
+    build_not_query() to emit '-' negation instead of 'NOT'.
+    """
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+        self.query_obj = connections["default"].get_query()
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def _prepare(self, query_string):
+        return AutoQuery(query_string).prepare(self.query_obj)
+
+    # --- clean: OR stripping ---
+
+    def test_or_uppercase_stripped(self):
+        """OR (uppercase) should be removed from the query."""
+        prepared = self._prepare("cats OR dogs")
+        assert "OR" not in prepared.split()
+        assert "cats" in prepared.split()
+        assert "dogs" in prepared.split()
+
+    def test_or_lowercase_stripped(self):
+        """or (lowercase) should be removed from the query."""
+        prepared = self._prepare("cats or dogs")
+        assert "or" not in prepared.split()
+        assert "cats" in prepared.split()
+        assert "dogs" in prepared.split()
+
+    def test_or_mixed_case_stripped(self):
+        """Or (mixed case) should be removed from the query."""
+        prepared = self._prepare("cats Or dogs")
+        assert "Or" not in prepared.split()
+        assert "cats" in prepared.split()
+        assert "dogs" in prepared.split()
+
+    def test_or_not_stripped_within_word(self):
+        """Words containing 'or' should not be affected."""
+        assert self._prepare("organic oracle") == "organic oracle"
+
+    # --- build_not_query: dash negation ---
+
+    def test_negation_uses_dash(self):
+        """Negated terms should use '-' prefix, not 'NOT'."""
+        prepared = self._prepare("-dogs")
+        assert prepared == "-dogs"
+
+    def test_negation_with_positive_term(self):
+        """Negated term mixed with positive term."""
+        prepared = self._prepare("cats -dogs")
+        assert prepared == "cats -dogs"
+
+    def test_multiple_negations(self):
+        """Multiple negated terms should each get '-' prefix."""
+        prepared = self._prepare("-cats -dogs")
+        assert prepared == "-cats -dogs"
+
+    # --- exact phrases ---
+
+    def test_quoted_phrase_preserved(self):
+        """Quoted phrases should pass through with quotes."""
+        prepared = self._prepare('"search backend"')
+        assert prepared == '"search backend"'
+
+    def test_quoted_phrase_with_other_terms(self):
+        """Quoted phrase alongside plain terms."""
+        prepared = self._prepare('cats "search backend" dogs')
+        assert prepared == 'cats "search backend" dogs'
+
+    # --- combined ---
+
+    def test_negation_and_phrase(self):
+        """Negation and quoted phrase together."""
+        prepared = self._prepare('cats -dogs "exact phrase"')
+        assert prepared == 'cats -dogs "exact phrase"'
+
+    def test_or_stripped_with_negation_and_phrase(self):
+        """OR stripped while negation and quotes are preserved."""
+        prepared = self._prepare('cats OR -dogs "exact phrase"')
+        assert "OR" not in prepared.split()
+        assert "-dogs" in prepared
+        assert '"exact phrase"' in prepared
+
+    # --- integration: SQS auto_query produces correct results ---
+
+    def test_auto_query_negation_excludes_results(self):
+        """auto_query negation should exclude documents with the negated term."""
+        sqs_positive = SearchQuerySet().auto_query("search")
+        sqs_negated = SearchQuerySet().auto_query("search -backend")
+        assert len(sqs_negated) < len(sqs_positive)
+
+    def test_auto_query_phrase_search(self):
+        """auto_query phrase should match only documents with that exact phrase."""
+        sqs_phrase = SearchQuerySet().auto_query('"search backend"')
+        sqs_words = SearchQuerySet().auto_query("search backend")
+        # Phrase is at least as restrictive as individual words
+        assert len(sqs_phrase) <= len(sqs_words)
+        assert len(sqs_phrase) > 0
+
+    def test_auto_query_or_not_treated_as_disjunction(self):
+        """auto_query should strip OR, so 'a OR b' behaves like 'a b' (AND)."""
+        sqs_or = SearchQuerySet().auto_query("indexing OR template")
+        sqs_and = SearchQuerySet().auto_query("indexing template")
+        assert len(sqs_or) == len(sqs_and)
 
 
 # ---------------------------------------------------------------------------
@@ -2003,3 +2123,594 @@ class TestTrigramSupport(TestCase):
                     "DROP INDEX IF EXISTS " "haystack_index_core_mockmodel_author_trgm"
                 )
             backend_teardown(self)
+
+
+# ---------------------------------------------------------------------------
+# Adversarial inputs
+# ---------------------------------------------------------------------------
+
+
+class TestAdversarialInputs(TestCase):
+    """Tests for malformed, unusual, or hostile inputs.
+
+    These target error-handling gaps where exceptions other than DatabaseError
+    escape the silently_fail guard.
+    """
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        self.another_index = AnotherMockSearchIndex()
+        backend_setup(self, [self.index, self.another_index])
+        self.backend.update(self.index, MockModel.objects.all())
+        self.backend.update(self.another_index, AnotherMockModel.objects.all())
+        self.backend.silently_fail = True
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    # --- Narrow query parsing ---
+
+    def test_malformed_narrow_query(self):
+        """A narrow query that doesn't match field:"value" should not crash."""
+        result = self.backend.search("*", narrow_queries=["not a valid narrow"])
+        assert result["hits"] == 0 or result["results"] == []
+
+    def test_narrow_query_missing_quotes(self):
+        """Narrow query without quotes should not crash."""
+        result = self.backend.search("*", narrow_queries=["author:daniel1"])
+        assert result["hits"] == 0 or result["results"] == []
+
+    def test_narrow_query_empty_value(self):
+        """Narrow query with empty quoted value should not crash."""
+        result = self.backend.search("*", narrow_queries=['author:""'])
+        assert result["hits"] == 0 or result["results"] == []
+
+    # --- Colon edge cases in query strings ---
+
+    def test_search_colon_only(self):
+        """Searching for ':' alone should not crash."""
+        result = self.backend.search(":")
+        assert isinstance(result["hits"], int)
+
+    def test_search_leading_colon(self):
+        """Searching for ':value' (empty field name) should not crash."""
+        result = self.backend.search(":value")
+        assert isinstance(result["hits"], int)
+
+    def test_search_trailing_colon(self):
+        """Searching for 'field:' (empty value) should not crash."""
+        result = self.backend.search("author:")
+        assert isinstance(result["hits"], int)
+
+    def test_search_multiple_colons(self):
+        """Searching for 'a:b:c' should not crash."""
+        result = self.backend.search("a:b:c")
+        assert isinstance(result["hits"], int)
+
+    # --- remove() with bad identifiers ---
+    # Per haystack convention, invalid identifiers are programming errors
+    # and should raise regardless of silently_fail.
+
+    def test_remove_invalid_model_string(self):
+        """remove('nonexistent.model.1') raises — invalid model is a programming error."""
+        with pytest.raises(LookupError):
+            self.backend.remove("nonexistent.model.1")
+
+    def test_remove_unindexed_model_string(self):
+        """remove() for a model not in the search index raises."""
+        with pytest.raises(Exception):
+            self.backend.remove("auth.user.1")
+
+    def test_remove_empty_pk(self):
+        """remove('core.mockmodel.') is a no-op (matches nothing)."""
+        self.backend.remove("core.mockmodel.")
+
+    def test_remove_too_few_parts(self):
+        """remove('just_a_string') raises — invalid format is a programming error."""
+        with pytest.raises(ValueError):
+            self.backend.remove("just_a_string")
+
+    # --- Websearch syntax edge cases ---
+
+    def test_search_unmatched_quote(self):
+        """Unmatched double-quote should not crash."""
+        result = self.backend.search('"unclosed phrase')
+        assert isinstance(result["hits"], int)
+
+    def test_search_only_operators(self):
+        """Search for 'OR' (a websearch operator) alone should not crash."""
+        result = self.backend.search("OR")
+        assert isinstance(result["hits"], int)
+
+    def test_search_negation_only(self):
+        """Search for '-everything' should not crash."""
+        result = self.backend.search("-everything")
+        assert isinstance(result["hits"], int)
+
+    def test_search_special_characters(self):
+        """Search with brackets, pipes, ampersands should not crash."""
+        result = self.backend.search("(foo) & [bar] | <baz>")
+        assert isinstance(result["hits"], int)
+
+    def test_search_null_byte(self):
+        """Null bytes in search text should not crash with silently_fail."""
+        result = self.backend.search("test\x00injection")
+        assert isinstance(result["hits"], int)
+
+    def test_search_sql_injection_attempt(self):
+        """SQL injection via search text is neutralized by parameterized queries."""
+        result = self.backend.search("'; DROP TABLE haystack_index_core_mockmodel; --")
+        assert isinstance(result["hits"], int)
+        # Verify the table still exists
+        index_model = get_index_model(MockModel)
+        assert index_model.objects.count() > 0
+
+    def test_search_backslash_heavy(self):
+        """Backslashes should not break websearch parsing."""
+        result = self.backend.search("test\\value\\\\more")
+        assert isinstance(result["hits"], int)
+
+    def test_search_very_long_query(self):
+        """A very long query string should not crash."""
+        result = self.backend.search("word " * 5000)
+        assert isinstance(result["hits"], int)
+
+    def test_search_unicode_emoji(self):
+        """Emoji in search text should not crash."""
+        result = self.backend.search("\U0001f600 \U0001f4a9 \U0001f680")
+        assert isinstance(result["hits"], int)
+
+    def test_search_unicode_cjk(self):
+        """CJK characters in search text should not crash."""
+        result = self.backend.search("\u4e16\u754c\u4f60\u597d")
+        assert isinstance(result["hits"], int)
+
+    def test_search_unicode_combining_chars(self):
+        """Combining characters (e.g. accented e as e + combining accent) should not crash."""
+        result = self.backend.search("caf\u0065\u0301")  # NFD form of café
+        assert isinstance(result["hits"], int)
+
+    def test_search_tabs_and_newlines(self):
+        """Whitespace variations in query should not crash."""
+        result = self.backend.search("test\t\nvalue\r\n")
+        assert isinstance(result["hits"], int)
+
+    def test_search_zero_width_chars(self):
+        """Zero-width characters should not crash."""
+        result = self.backend.search("te\u200bst\u200dval\u200cue")
+        assert isinstance(result["hits"], int)
+
+    # --- Multi-model edge cases ---
+
+    def test_multi_model_highlight(self):
+        """Highlighting in multi-model search should not crash."""
+        result = self.backend.search("daniel3", highlight=True)
+        assert result["hits"] > 0
+        has_highlight = False
+        for r in result["results"]:
+            if hasattr(r, "highlighted") and r.highlighted:
+                has_highlight = True
+        assert has_highlight
+
+    def test_multi_model_boost(self):
+        """Boosting in multi-model search should not crash."""
+        result = self.backend.search("daniel3", boost={"indexing": 2.0})
+        assert result["hits"] > 0
+
+    def test_multi_model_search_match_one_model_only(self):
+        """Search matching only one model in a multi-model setup returns results."""
+        # "daniel3" exists in both models via fixture data,
+        # so narrow to author (only on MockModel) to get single-model results
+        result = self.backend.search(
+            "daniel3", narrow_queries=['author:"daniel3"']
+        )
+        assert result["hits"] > 0
+        for r in result["results"]:
+            assert r.model == MockModel
+
+    def test_multi_model_facet_on_single_model_field(self):
+        """Faceting on a field that only one model has should work."""
+        result = self.backend.search("*", facets=["author"])
+        assert "facets" in result
+        assert "fields" in result["facets"]
+        assert "author" in result["facets"]["fields"]
+
+    # --- SearchQuerySet API edge cases ---
+
+    def test_sqs_auto_query_sql_injection(self):
+        """auto_query with SQL injection attempt should not crash."""
+        sqs = SearchQuerySet().auto_query("'; DROP TABLE users; --")
+        assert isinstance(len(sqs), int)
+
+    def test_sqs_auto_query_all_negated(self):
+        """auto_query where every term is negated should not crash."""
+        sqs = SearchQuerySet().auto_query("-this -that -other")
+        assert isinstance(len(sqs), int)
+
+    def test_sqs_auto_query_only_quotes(self):
+        """auto_query with only quote characters should not crash."""
+        sqs = SearchQuerySet().auto_query('"""')
+        assert isinstance(len(sqs), int)
+
+    def test_sqs_filter_empty_string(self):
+        """Filtering content for empty string should not crash."""
+        sqs = SearchQuerySet().filter(content="")
+        assert isinstance(len(sqs), int)
+
+    def test_sqs_slice_beyond_results(self):
+        """Slicing past the end of results returns empty, not error."""
+        sqs = SearchQuerySet().all()
+        sliced = list(sqs[99999:99999 + 10])
+        assert sliced == []
+
+    def test_sqs_order_then_filter(self):
+        """Order followed by filter should not crash."""
+        sqs = SearchQuerySet().order_by("pub_date").filter(content="indexing")
+        assert isinstance(len(sqs), int)
+
+    # --- Boost edge cases ---
+
+    def test_boost_empty_dict(self):
+        """Boost with empty dict should be a no-op."""
+        result = self.backend.search("indexing", boost={})
+        assert result["hits"] > 0
+
+    def test_boost_zero_weight(self):
+        """Boost with zero weight should not crash."""
+        result = self.backend.search("indexing", boost={"test": 0.0})
+        assert result["hits"] > 0
+
+    def test_boost_negative_weight(self):
+        """Boost with negative weight should not crash."""
+        result = self.backend.search("indexing", boost={"test": -1.0})
+        assert result["hits"] > 0
+
+    # --- Update/remove edge cases ---
+
+    def test_update_then_search_immediately(self):
+        """Documents are searchable immediately after update."""
+        result = self.backend.search("daniel1")
+        assert result["hits"] > 0
+
+    def test_remove_nonexistent_document(self):
+        """Removing a document that doesn't exist is a no-op."""
+        obj = MockModel.objects.first()
+        self.backend.remove(obj)
+        # Remove again — should not crash
+        self.backend.remove(obj)
+
+    def test_update_idempotent(self):
+        """Updating the same documents twice doesn't create duplicates."""
+        self.backend.update(self.index, MockModel.objects.all())
+        self.backend.update(self.index, MockModel.objects.all())
+        result = self.backend.search("*")
+        assert result["hits"] == MockModel.objects.count() + AnotherMockModel.objects.count()
+
+
+# ---------------------------------------------------------------------------
+# Search and retrieval correctness
+# ---------------------------------------------------------------------------
+
+
+class TestSearchCorrectness(TestCase):
+    """Verify that searches return the RIGHT results — correct documents,
+    correct fields, correct scores, correct order."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.mock_index = MockSearchIndex()
+        self.another_index = AnotherMockSearchIndex()
+        self.score_index = ScoreMockSearchIndex()
+        backend_setup(
+            self,
+            [self.mock_index, self.another_index, self.score_index],
+        )
+        self.backend.update(self.mock_index, MockModel.objects.all())
+        self.backend.update(self.another_index, AnotherMockModel.objects.all())
+        self.backend.update(self.score_index, ScoreMockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    # --- Field value correctness ---
+
+    def test_author_field_matches_database(self):
+        """Every MockModel result's author field should match the database."""
+        results = self.backend.search("*", models=[MockModel])
+        assert results["hits"] == MockModel.objects.count()
+        for r in results["results"]:
+            db_obj = MockModel.objects.get(pk=r.pk)
+            assert r.author == db_obj.author
+
+    def test_pub_date_field_matches_database(self):
+        """Every MockModel result's pub_date should match the database."""
+        results = self.backend.search("*", models=[MockModel])
+        for r in results["results"]:
+            db_obj = MockModel.objects.get(pk=r.pk)
+            assert r.pub_date == db_obj.pub_date
+
+    def test_result_attributes(self):
+        """Each result has correct app_label, model_name, and model class."""
+        results = self.backend.search("*", models=[MockModel])
+        for r in results["results"]:
+            assert r.app_label == "core"
+            assert r.model_name == "mockmodel"
+            assert r.model == MockModel
+
+    # --- Filter correctness ---
+
+    def test_filter_exact_returns_correct_pks(self):
+        """filter(author='daniel1') returns exactly the right PKs."""
+        expected_pks = set(
+            MockModel.objects.filter(author="daniel1").values_list("pk", flat=True)
+        )
+        sqs = SearchQuerySet().models(MockModel).filter(author__exact="daniel1")
+        result_pks = {int(r.pk) for r in sqs}
+        assert result_pks == expected_pks
+
+    def test_filter_in_returns_correct_pks(self):
+        """filter(author__in=['daniel1', 'daniel2']) returns their union."""
+        expected_pks = set(
+            MockModel.objects.filter(author__in=["daniel1", "daniel2"]).values_list(
+                "pk", flat=True
+            )
+        )
+        sqs = SearchQuerySet().models(MockModel).filter(
+            author__in=["daniel1", "daniel2"]
+        )
+        result_pks = {int(r.pk) for r in sqs}
+        assert result_pks == expected_pks
+
+    def test_exclude_removes_correct_pks(self):
+        """exclude(author='daniel1') returns everyone else."""
+        excluded_pks = set(
+            MockModel.objects.filter(author="daniel1").values_list("pk", flat=True)
+        )
+        sqs = SearchQuerySet().models(MockModel).exclude(author__exact="daniel1")
+        result_pks = {int(r.pk) for r in sqs}
+        assert result_pks & excluded_pks == set()
+        assert len(result_pks) == MockModel.objects.exclude(author="daniel1").count()
+
+    def test_date_boundary_filter(self):
+        """pub_date__lt=2009-07-01 returns only the June documents."""
+        cutoff = datetime(2009, 7, 1)
+        expected_pks = set(
+            MockModel.objects.filter(pub_date__lt=cutoff).values_list("pk", flat=True)
+        )
+        assert len(expected_pks) > 0  # Sanity: some docs are in June
+        sqs = SearchQuerySet().models(MockModel).filter(pub_date__lt=cutoff)
+        result_pks = {int(r.pk) for r in sqs}
+        assert result_pks == expected_pks
+
+    def test_combined_filters_intersect(self):
+        """author='daniel3' AND pub_date before July returns the intersection."""
+        cutoff = datetime(2009, 7, 1)
+        expected_pks = set(
+            MockModel.objects.filter(author="daniel3", pub_date__lt=cutoff).values_list(
+                "pk", flat=True
+            )
+        )
+        sqs = SearchQuerySet().models(MockModel).filter(
+            author__exact="daniel3", pub_date__lt=cutoff
+        )
+        result_pks = {int(r.pk) for r in sqs}
+        assert result_pks == expected_pks
+
+    # --- Scoring correctness ---
+
+    def test_scores_are_nonnegative(self):
+        """All search scores should be >= 0."""
+        results = self.backend.search("indexing")
+        for r in results["results"]:
+            assert r.score >= 0
+
+    def test_scores_strictly_sorted(self):
+        """Scores should be in non-increasing order."""
+        results = self.backend.search("indexing")
+        scores = [r.score for r in results["results"]]
+        for i in range(len(scores) - 1):
+            assert scores[i] >= scores[i + 1]
+
+    def test_wildcard_search_scores_are_zero(self):
+        """Wildcard '*' search assigns score=0 to all results."""
+        results = self.backend.search("*")
+        for r in results["results"]:
+            assert r.score == 0
+
+    # --- Phrase search correctness ---
+
+    def test_phrase_search_is_subset_of_word_search(self):
+        """Phrase results should be a subset of individual word results."""
+        word_results = self.backend.search("search backend")
+        phrase_results = self.backend.search('"search backend"')
+        word_pks = {(r.app_label, r.pk) for r in word_results["results"]}
+        phrase_pks = {(r.app_label, r.pk) for r in phrase_results["results"]}
+        assert phrase_pks <= word_pks
+
+    def test_phrase_search_more_restrictive(self):
+        """Phrase search should match fewer or equal documents than word search."""
+        word_hits = self.backend.search("search backend")["hits"]
+        phrase_hits = self.backend.search('"search backend"')["hits"]
+        assert phrase_hits <= word_hits
+
+    # --- Highlighting correctness ---
+
+    def test_highlight_contains_markup(self):
+        """Highlighted text should contain <b> tags from ts_headline."""
+        results = self.backend.search("indexing", highlight=True, models=[MockModel])
+        assert results["hits"] > 0
+        found_markup = False
+        for r in results["results"]:
+            highlighted = getattr(r, "highlighted", None)
+            if highlighted:
+                for field, fragments in highlighted.items():
+                    for frag in fragments:
+                        if "<b>" in frag:
+                            found_markup = True
+        assert found_markup, "No <b> markup found in any highlighted result"
+
+    def test_highlight_contains_search_term(self):
+        """The highlighted fragment should contain the stemmed search term."""
+        results = self.backend.search("indexing", highlight=True, models=[MockModel])
+        found_term = False
+        for r in results["results"]:
+            highlighted = getattr(r, "highlighted", None)
+            if highlighted:
+                for fragments in highlighted.values():
+                    for frag in fragments:
+                        if "index" in frag.lower():
+                            found_term = True
+        assert found_term, "Search term not found in any highlighted fragment"
+
+    def test_highlight_field_key_is_content_field(self):
+        """The highlighted dict key should be the content field name."""
+        results = self.backend.search("indexing", highlight=True, models=[MockModel])
+        for r in results["results"]:
+            highlighted = getattr(r, "highlighted", None)
+            if highlighted:
+                assert "text" in highlighted
+
+    # --- Boost correctness ---
+
+    def test_boost_changes_ranking(self):
+        """Boosting a term should change the result order."""
+        unboosted = self.backend.search("indexing", models=[MockModel])
+        boosted = self.backend.search(
+            "indexing", models=[MockModel], boost={"template": 10.0}
+        )
+        unboosted_pks = [r.pk for r in unboosted["results"]]
+        boosted_pks = [r.pk for r in boosted["results"]]
+        assert unboosted_pks != boosted_pks, "Boost had no effect on ordering"
+
+    def test_boost_increases_score_of_matching_docs(self):
+        """Documents matching the boosted term should score higher than without boost."""
+        unboosted = self.backend.search("indexing", models=[MockModel])
+        boosted = self.backend.search(
+            "indexing", models=[MockModel], boost={"template": 10.0}
+        )
+        # Build pk→score maps
+        unboosted_scores = {r.pk: r.score for r in unboosted["results"]}
+        boosted_scores = {r.pk: r.score for r in boosted["results"]}
+        # At least one doc that matches "template" should have a higher score
+        any_increased = any(
+            boosted_scores.get(pk, 0) > unboosted_scores.get(pk, 0)
+            for pk in boosted_scores
+        )
+        assert any_increased
+
+    # --- Facet correctness ---
+
+    def test_facet_counts_sum_to_total(self):
+        """Author facet counts should sum to total search hits."""
+        results = self.backend.search("*", models=[MockModel], facets=["author"])
+        total_hits = results["hits"]
+        facet_values = results["facets"]["fields"]["author"]
+        facet_sum = sum(count for _, count in facet_values)
+        assert facet_sum == total_hits
+
+    def test_facet_values_match_database(self):
+        """Author facet values should match actual author counts in the database."""
+        results = self.backend.search("*", models=[MockModel], facets=["author"])
+        facet_dict = dict(results["facets"]["fields"]["author"])
+        for author in ["daniel1", "daniel2", "daniel3"]:
+            expected = MockModel.objects.filter(author=author).count()
+            assert facet_dict[author] == expected, (
+                f"Facet count for {author}: expected {expected}, got {facet_dict[author]}"
+            )
+
+    def test_facet_sorted_by_count_desc(self):
+        """Facet values should be sorted by count descending."""
+        results = self.backend.search("*", models=[MockModel], facets=["author"])
+        facet_values = results["facets"]["fields"]["author"]
+        counts = [count for _, count in facet_values]
+        assert counts == sorted(counts, reverse=True)
+
+    # --- Pagination correctness ---
+
+    def test_paginated_results_reassemble_to_full(self):
+        """Paginating with page_size=3 and reassembling gives the same set as full query."""
+        full = self.backend.search("*", models=[MockModel])
+        full_pks = {r.pk for r in full["results"]}
+
+        reassembled_pks = set()
+        offset = 0
+        page_size = 3
+        while offset < full["hits"]:
+            page = self.backend.search(
+                "*", models=[MockModel], start_offset=offset, end_offset=offset + page_size
+            )
+            for r in page["results"]:
+                reassembled_pks.add(r.pk)
+            offset += page_size
+
+        assert reassembled_pks == full_pks
+
+    def test_page_hits_stable_across_pages(self):
+        """Total hits count should be the same on every page."""
+        full_hits = self.backend.search("*", models=[MockModel])["hits"]
+        for offset in range(0, full_hits, 5):
+            page = self.backend.search(
+                "*", models=[MockModel], start_offset=offset, end_offset=offset + 5
+            )
+            assert page["hits"] == full_hits
+
+    # --- Multi-model field correctness ---
+
+    def test_multi_model_mockmodel_has_author(self):
+        """MockModel results in multi-model search have their author field."""
+        results = self.backend.search("*")
+        for r in results["results"]:
+            if r.model == MockModel:
+                db_obj = MockModel.objects.get(pk=r.pk)
+                assert r.author == db_obj.author
+
+    def test_multi_model_another_has_no_author_value(self):
+        """AnotherMockModel results should have author=None (field doesn't exist on that index)."""
+        results = self.backend.search("*")
+        found = False
+        for r in results["results"]:
+            if r.model == AnotherMockModel:
+                found = True
+                assert r.author is None
+        assert found, "No AnotherMockModel results found"
+
+    def test_multi_model_score_model_has_text(self):
+        """ScoreMockModel results should have their text field populated."""
+        results = self.backend.search("*")
+        found_score_model = False
+        for r in results["results"]:
+            if r.model == ScoreMockModel:
+                found_score_model = True
+                assert r.text is not None
+        assert found_score_model, "No ScoreMockModel results found"
+
+    # --- Negation correctness ---
+
+    def test_negation_excludes_term(self):
+        """'indexing -template' should not return docs matching 'template'."""
+        positive = self.backend.search("template", models=[MockModel])
+        negated = self.backend.search("indexing -template", models=[MockModel])
+        positive_pks = {r.pk for r in positive["results"]}
+        negated_pks = {r.pk for r in negated["results"]}
+        # No result in negated should appear in positive (template-matching) set
+        assert negated_pks & positive_pks == set()
+
+    # --- Narrow correctness ---
+
+    def test_narrow_returns_only_matching_values(self):
+        """Narrowing to author:'daniel1' returns only daniel1 docs."""
+        results = self.backend.search("*", narrow_queries=['author:"daniel1"'])
+        for r in results["results"]:
+            if r.model == MockModel:
+                assert r.author == "daniel1"
+
+    def test_narrow_hit_count_matches_database(self):
+        """Narrow to author:'daniel1' should match the DB count."""
+        results = self.backend.search(
+            "*", models=[MockModel], narrow_queries=['author:"daniel1"']
+        )
+        expected = MockModel.objects.filter(author="daniel1").count()
+        assert results["hits"] == expected
