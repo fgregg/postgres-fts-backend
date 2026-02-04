@@ -5,6 +5,7 @@ import re
 from typing import Any, NotRequired, TypedDict
 
 from django.apps import apps as django_apps
+from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.search import (
     SearchHeadline,
     SearchQuery,
@@ -13,7 +14,7 @@ from django.contrib.postgres.search import (
 )
 from django.core.exceptions import FieldDoesNotExist, FieldError
 from django.db import DatabaseError, models
-from django.db.models import Count, F, FloatField, Q, Value
+from django.db.models import Count, F, FloatField, Func, Q, Value
 from django.db.models.functions import Trunc
 from django.utils.encoding import force_str
 from haystack import connections
@@ -167,11 +168,14 @@ class IndexSearch:
             field, value = match.group(1), match.group(2)
             col = _resolve_field_name(field)
             try:
-                self.qs.model._meta.get_field(col)
+                model_field = self.qs.model._meta.get_field(col)
             except FieldDoesNotExist:
                 self.qs = self.qs.none()
                 return
-            self.qs = self.qs.filter(**{col: value})
+            if isinstance(model_field, ArrayField):
+                self.qs = self.qs.filter(**{f"{col}__contains": [value]})
+            else:
+                self.qs = self.qs.filter(**{col: value})
 
     def highlight(self) -> None:
         if self.search_text is None:
@@ -216,14 +220,26 @@ class IndexSearch:
             result["fields"] = {}
             for field_name in facets:
                 col = _resolve_field_name(field_name)
-                facet_qs = (
-                    self.qs.values(col)
-                    .annotate(count=Count("id"))
-                    .order_by("-count", col)
-                )
-                result["fields"][field_name] = [
-                    (row[col], row["count"]) for row in facet_qs
-                ]
+                model_field = self.qs.model._meta.get_field(col)
+                if isinstance(model_field, ArrayField):
+                    facet_qs = (
+                        self.qs.annotate(_facet_val=Func(F(col), function="unnest"))
+                        .values("_facet_val")
+                        .annotate(count=Count("id"))
+                        .order_by("-count", "_facet_val")
+                    )
+                    result["fields"][field_name] = [
+                        (row["_facet_val"], row["count"]) for row in facet_qs
+                    ]
+                else:
+                    facet_qs = (
+                        self.qs.values(col)
+                        .annotate(count=Count("id"))
+                        .order_by("-count", col)
+                    )
+                    result["fields"][field_name] = [
+                        (row[col], row["count"]) for row in facet_qs
+                    ]
 
         if date_facets:
             result["dates"] = {}
@@ -675,6 +691,14 @@ class ORMSearchQuery(BaseSearchQuery):
     def build_not_query(self, query_string):
         return f"-{query_string}"
 
+    def _is_multivalued(self, field):
+        """Check if a haystack field is multivalued (maps to ArrayField)."""
+        ui = connections["default"].get_unified_index()
+        for index in ui.get_indexes().values():
+            if field in index.fields:
+                return index.fields[field].is_multivalued
+        return False
+
     def build_query_fragment(self, field, filter_type, value):
         if hasattr(value, "prepare"):
             value = value.prepare(self)
@@ -689,6 +713,8 @@ class ORMSearchQuery(BaseSearchQuery):
                         config=self.backend.search_config,
                     )
                 )
+            if self._is_multivalued(field):
+                return Q(**{f"{field}__contains": [value]})
             return Q(**{f"{field}__trigram_similar": value})
 
         if filter_type == "fuzzy":
@@ -700,6 +726,10 @@ class ORMSearchQuery(BaseSearchQuery):
                 return Q(pk__in=[])
         elif filter_type == "range":
             value = (value[0], value[1])
+
+        # For MultiValueField (ArrayField), use array containment.
+        if filter_type == "exact" and self._is_multivalued(field):
+            return Q(**{f"{field}__contains": [value]})
 
         # contains/startswith/endswith → case-insensitive Django lookups
         lookup = {

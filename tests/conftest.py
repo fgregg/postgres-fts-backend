@@ -4,6 +4,7 @@ from haystack import connections
 from haystack.utils.loading import UnifiedIndex
 
 from tests.search_indexes import (
+    AllFieldsSearchIndex,
     AnotherMockSearchIndex,
     MockSearchIndex,
     ScoreMockSearchIndex,
@@ -16,7 +17,12 @@ def _build_search_schema(django_db_setup, django_db_blocker):
     # Register test indexes so build_postgres_schema can find them
     ui = UnifiedIndex()
     ui.build(
-        indexes=[MockSearchIndex(), AnotherMockSearchIndex(), ScoreMockSearchIndex()]
+        indexes=[
+            MockSearchIndex(),
+            AnotherMockSearchIndex(),
+            ScoreMockSearchIndex(),
+            AllFieldsSearchIndex(),
+        ]
     )
     connections["default"]._index = ui
 

@@ -4,11 +4,12 @@ import shutil
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import date, datetime
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 from django.contrib.postgres.search import SearchQuery, SearchVectorField
 from django.core.exceptions import FieldError
@@ -18,19 +19,37 @@ from django.db.models import FloatField, Value
 from django.test import TestCase, override_settings
 from haystack import connections
 from haystack import indexes as haystack_indexes
+from haystack.fields import (
+    FacetBooleanField,
+    FacetCharField,
+    FacetDateField,
+    FacetDateTimeField,
+    FacetDecimalField,
+    FacetFloatField,
+    FacetIntegerField,
+    FacetMultiValueField,
+)
 from haystack.inputs import AutoQuery
 from haystack.query import SQ, RelatedSearchQuerySet, SearchQuerySet
 from haystack.utils.loading import UnifiedIndex
 
 import postgres_fts_backend.models as models_module
 from postgres_fts_backend.models import (
+    FIELD_MAP,
+    _django_field_for,
     generate_index_models,
     get_index_model,
     validate_all_schemas,
 )
-from tests.core.models import AnotherMockModel, MockModel, ScoreMockModel
+from tests.core.models import (
+    AllFieldsModel,
+    AnotherMockModel,
+    MockModel,
+    ScoreMockModel,
+)
 from tests.mocks import MockSearchResult
 from tests.search_indexes import (
+    AllFieldsSearchIndex,
     AnotherMockSearchIndex,
     MockSearchIndex,
     ScoreMockSearchIndex,
@@ -1501,6 +1520,7 @@ class TestMigrationChangeDetection(TestCase):
         self.index = MockSearchIndex()
         self.another_index = AnotherMockSearchIndex()
         self.score_index = ScoreMockSearchIndex()
+        self.allfields_index = AllFieldsSearchIndex()
 
     def tearDown(self):
         self.models_module._index_models_cache.clear()
@@ -1532,15 +1552,17 @@ class TestMigrationChangeDetection(TestCase):
         self.addCleanup(sys.modules.pop, module_name, None)
         return pkg_dir
 
+    def _all_indexes(self, mock_override=None):
+        mock = mock_override or self.index
+        return [mock, self.another_index, self.score_index, self.allfields_index]
+
     def test_adding_field_generates_add_field_migration(self):
         """Registering an extended index with an extra IntegerField generates an AddField migration."""
 
         class ExtendedMockSearchIndex(MockSearchIndex):
             extra_field = haystack_indexes.IntegerField(default=0)
 
-        backend_setup(
-            self, [ExtendedMockSearchIndex(), self.another_index, self.score_index]
-        )
+        backend_setup(self, self._all_indexes(mock_override=ExtendedMockSearchIndex()))
         self.models_module._index_models_cache.clear()
 
         module_name = "temp_mig_addfield"
@@ -1568,9 +1590,7 @@ class TestMigrationChangeDetection(TestCase):
         class ExtendedMockSearchIndex(MockSearchIndex):
             extra_field = haystack_indexes.IntegerField(default=0)
 
-        backend_setup(
-            self, [ExtendedMockSearchIndex(), self.another_index, self.score_index]
-        )
+        backend_setup(self, self._all_indexes(mock_override=ExtendedMockSearchIndex()))
         self.models_module._index_models_cache.clear()
 
         module_name = "temp_mig_apply"
@@ -1593,7 +1613,7 @@ class TestMigrationChangeDetection(TestCase):
             # Roll back: restore original indexes, regenerate, and migrate
             self.models_module._index_models_cache.clear()
             backend_teardown(self)
-            backend_setup(self, [self.index, self.another_index, self.score_index])
+            backend_setup(self, self._all_indexes())
             self.models_module._index_models_cache.clear()
 
             call_command("build_postgres_schema", verbosity=0)
@@ -1613,7 +1633,7 @@ class TestMigrationChangeDetection(TestCase):
 
     def test_no_changes_detected_when_schema_matches(self):
         """With standard indexes, build_postgres_schema outputs 'No changes detected'."""
-        backend_setup(self, [self.index, self.another_index, self.score_index])
+        backend_setup(self, self._all_indexes())
 
         module_name = "temp_mig_nochange"
         pkg_dir = self._make_migration_package(module_name)
@@ -2025,6 +2045,7 @@ class TestTrigramSupport(TestCase):
         models_module._index_models_cache.clear()
         self.another_index = AnotherMockSearchIndex()
         self.score_index = ScoreMockSearchIndex()
+        self.allfields_index = AllFieldsSearchIndex()
 
     def tearDown(self):
         self.models_module._index_models_cache.clear()
@@ -2065,7 +2086,10 @@ class TestTrigramSupport(TestCase):
     def test_generate_index_models_includes_trigram_index(self):
         """EdgeNgramField gets a GIN trigram index when pg_trgm is installed."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index, self.score_index])
+        backend_setup(
+            self,
+            [ngram_index, self.another_index, self.score_index, self.allfields_index],
+        )
         try:
             schema = generate_index_models()
             indexes = schema[MockModel]._meta.indexes
@@ -2080,7 +2104,10 @@ class TestTrigramSupport(TestCase):
     def test_migration_adds_trigram_index(self):
         """Switching author to EdgeNgramField generates an AddIndex with gin_trgm_ops."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index, self.score_index])
+        backend_setup(
+            self,
+            [ngram_index, self.another_index, self.score_index, self.allfields_index],
+        )
         try:
             module_name = "temp_mig_trgm_add"
             pkg_dir = self._make_migration_package(module_name)
@@ -2105,7 +2132,10 @@ class TestTrigramSupport(TestCase):
     def test_trigram_index_used_for_similarity_query(self):
         """EXPLAIN shows the GIN trigram index for a trigram_similar lookup."""
         ngram_index = self._ngram_index()
-        backend_setup(self, [ngram_index, self.another_index, self.score_index])
+        backend_setup(
+            self,
+            [ngram_index, self.another_index, self.score_index, self.allfields_index],
+        )
         try:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2724,3 +2754,271 @@ class TestSearchCorrectness(TestCase):
         )
         expected = MockModel.objects.filter(author="daniel1").count()
         assert results["hits"] == expected
+
+
+# ---------------------------------------------------------------------------
+# MultiValueField support
+# ---------------------------------------------------------------------------
+
+
+class TestMultiValueField(TestCase):
+    """Tests for MultiValueField indexing, filtering, and faceting."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_indexed_as_list(self):
+        """MultiValueField values should be stored as a list, not a string."""
+        index_model = get_index_model(MockModel)
+        row = index_model.objects.filter(django_id="1").first()
+        assert isinstance(row.categories, list)
+
+    def test_indexed_values_correct(self):
+        """MultiValueField should contain the values from prepare_categories."""
+        index_model = get_index_model(MockModel)
+        # daniel1 → ["general", "primary"]
+        row = index_model.objects.filter(django_id="1").first()
+        assert sorted(row.categories) == ["general", "primary"]
+        # daniel2 → ["general", "secondary"]
+        row = index_model.objects.filter(django_id="2").first()
+        assert sorted(row.categories) == ["general", "secondary"]
+        # daniel3 → ["general"]
+        row = index_model.objects.filter(django_id="3").first()
+        assert row.categories == ["general"]
+
+    def test_filter_contains_single_value(self):
+        """Filtering for a value present in the list should return matches."""
+        sqs = SearchQuerySet().filter(categories="primary")
+        pks = {int(r.pk) for r in sqs}
+        expected_pks = {
+            obj.pk for obj in MockModel.objects.filter(author__endswith="1")
+        }
+        assert pks == expected_pks
+
+    def test_filter_contains_excludes_non_matching(self):
+        """Filtering for a value should not return rows that lack it."""
+        sqs = SearchQuerySet().filter(categories="secondary")
+        for r in sqs:
+            obj = MockModel.objects.get(pk=r.pk)
+            assert obj.author.endswith("2")
+
+    def test_facet_counts(self):
+        """Faceting on a MultiValueField should count each value separately."""
+        sqs = SearchQuerySet().facet("categories")
+        facets = sqs.facet_counts()
+        cat_facets = dict(facets["fields"]["categories"])
+        total = MockModel.objects.count()
+        # Every document has "general"
+        assert cat_facets["general"] == total
+        # Only daniel1 authors have "primary"
+        assert (
+            cat_facets["primary"]
+            == MockModel.objects.filter(author__endswith="1").count()
+        )
+        # Only daniel2 authors have "secondary"
+        assert (
+            cat_facets["secondary"]
+            == MockModel.objects.filter(author__endswith="2").count()
+        )
+
+
+# ---------------------------------------------------------------------------
+# Search field type coverage
+# ---------------------------------------------------------------------------
+
+
+class TestSearchFieldTypes(TestCase):
+    """Verify every Haystack SearchField type can be indexed and queried."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.allfields_index = AllFieldsSearchIndex()
+        backend_setup(self, [self.allfields_index])
+        self.backend.update(self.allfields_index, AllFieldsModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def _get_row(self, pk):
+        index_model = get_index_model(AllFieldsModel)
+        return index_model.objects.get(django_id=str(pk))
+
+    # --- BooleanField ---
+
+    def test_boolean_field_true(self):
+        """BooleanField stores True correctly."""
+        row = self._get_row(1)
+        assert row.is_active is True
+
+    def test_boolean_field_false(self):
+        """BooleanField stores False correctly."""
+        row = self._get_row(2)
+        assert row.is_active is False
+
+    def test_boolean_field_filter(self):
+        """Filtering by exact boolean value returns correct rows."""
+        index_model = get_index_model(AllFieldsModel)
+        active = index_model.objects.filter(is_active=True)
+        assert active.count() == 2
+        inactive = index_model.objects.filter(is_active=False)
+        assert inactive.count() == 1
+
+    # --- IntegerField ---
+
+    def test_integer_field_stored(self):
+        """IntegerField stores integer values correctly."""
+        row = self._get_row(1)
+        assert row.count == 10
+        row = self._get_row(3)
+        assert row.count == 100
+
+    def test_integer_field_filter_exact(self):
+        """Filtering by exact integer value returns correct row."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(count=10)
+        assert results.count() == 1
+        assert results.first().django_id == "1"
+
+    def test_integer_field_filter_range(self):
+        """Filtering by integer range returns correct rows."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(count__gte=10)
+        assert results.count() == 2  # 10 and 100
+
+    # --- FloatField ---
+
+    def test_float_field_stored(self):
+        """FloatField stores float values correctly."""
+        row = self._get_row(1)
+        assert row.rating == pytest.approx(4.5)
+        row = self._get_row(2)
+        assert row.rating == pytest.approx(3.2)
+
+    def test_float_field_filter_range(self):
+        """Filtering by float range returns correct rows."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(rating__gte=4.0)
+        assert results.count() == 2  # 4.5 and 4.9
+
+    # --- DecimalField ---
+
+    def test_decimal_field_stored(self):
+        """DecimalField stores values (as text, per Haystack convention)."""
+        row = self._get_row(1)
+        # Haystack DecimalField converts to string
+        assert "19.99" in str(row.price)
+
+    def test_decimal_field_stored_all_values(self):
+        """All DecimalField values are present and distinct."""
+        index_model = get_index_model(AllFieldsModel)
+        prices = set(index_model.objects.values_list("price", flat=True))
+        assert len(prices) == 3
+
+    # --- DateField ---
+
+    def test_date_field_stored(self):
+        """DateField stores date values correctly."""
+        row = self._get_row(1)
+        assert row.created_date == date(2024, 1, 15)
+
+    def test_date_field_filter_range(self):
+        """Filtering by date range returns correct rows."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(created_date__gte=date(2024, 6, 1))
+        assert results.count() == 2  # June and December
+
+    # --- DateTimeField ---
+
+    def test_datetime_field_stored(self):
+        """DateTimeField stores datetime values correctly."""
+        row = self._get_row(2)
+        assert row.created_at.year == 2024
+        assert row.created_at.month == 6
+        assert row.created_at.day == 20
+
+    def test_datetime_field_filter_range(self):
+        """Filtering by datetime range returns correct rows."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(created_at__gte=datetime(2024, 6, 1))
+        assert results.count() == 2
+
+    # --- NgramField ---
+
+    def test_ngram_field_stored(self):
+        """NgramField stores text values correctly."""
+        row = self._get_row(1)
+        assert row.name_ngram == "Active Widget"
+
+    def test_ngram_field_trigram_similarity(self):
+        """NgramField supports trigram similarity queries."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.filter(name_ngram__trigram_similar="Widget")
+        assert results.count() >= 1
+        ids = {r.django_id for r in results}
+        assert "1" in ids
+
+    # --- CharField (document field) ---
+
+    def test_char_field_stored(self):
+        """CharField (document=True) stores text values correctly."""
+        row = self._get_row(3)
+        assert row.text == "Premium Device"
+
+    # --- Full-text search across field types ---
+
+    def test_full_text_search(self):
+        """Full-text search works on the document field."""
+        index_model = get_index_model(AllFieldsModel)
+        results = index_model.objects.search("widget")
+        assert results.count() == 1
+        assert results.first().django_id == "1"
+
+    # --- FIELD_MAP completeness ---
+
+    def test_field_map_covers_all_standard_types(self):
+        """FIELD_MAP has entries for all standard (non-geo) Haystack field types."""
+        expected_types = {
+            haystack_indexes.CharField,
+            haystack_indexes.EdgeNgramField,
+            haystack_indexes.NgramField,
+            haystack_indexes.DateTimeField,
+            haystack_indexes.DateField,
+            haystack_indexes.IntegerField,
+            haystack_indexes.FloatField,
+            haystack_indexes.BooleanField,
+            haystack_indexes.DecimalField,
+            haystack_indexes.MultiValueField,
+        }
+        assert expected_types == set(FIELD_MAP.keys())
+
+    def test_faceted_fields_resolve_via_inheritance(self):
+        """Faceted variants resolve to the same Django field as their parent type."""
+        faceted_pairs = [
+            (FacetCharField, models.TextField),
+            (FacetIntegerField, models.IntegerField),
+            (FacetFloatField, models.FloatField),
+            (FacetDecimalField, models.TextField),
+            (FacetBooleanField, models.BooleanField),
+            (FacetDateField, models.DateField),
+            (FacetDateTimeField, models.DateTimeField),
+            (FacetMultiValueField, ArrayField),
+        ]
+        for facet_cls, expected_django_cls in faceted_pairs:
+            field = _django_field_for(facet_cls())
+            assert isinstance(field, expected_django_cls), (
+                f"{facet_cls.__name__} should map to {expected_django_cls.__name__}, "
+                f"got {type(field).__name__}"
+            )
+
+    def test_location_field_raises_not_implemented(self):
+        """LocationField raises NotImplementedError."""
+        with pytest.raises(NotImplementedError, match="LocationField"):
+            _django_field_for(haystack_indexes.LocationField())

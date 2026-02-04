@@ -36,3 +36,16 @@ class AnotherMockModel(models.Model):
 
     def __str__(self):
         return self.author
+
+
+class AllFieldsModel(models.Model):
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True)
+    count = models.IntegerField(default=0)
+    rating = models.FloatField(default=0.0)
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    created_date = models.DateField()
+    created_at = models.DateTimeField()
+
+    def __str__(self):
+        return self.name

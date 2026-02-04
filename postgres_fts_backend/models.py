@@ -4,6 +4,7 @@ import warnings
 from collections.abc import Callable, Iterator
 from typing import Any
 
+from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVectorField
 from django.db import connection, models
@@ -84,7 +85,11 @@ class AlignedUnionQuerySet:
                 annotations = {}
                 for col_name in missing:
                     field_meta = all_columns[col_name]
-                    if hasattr(field_meta, "column"):
+                    if isinstance(field_meta, ArrayField):
+                        output_field: models.Field = ArrayField(
+                            field_meta.base_field.__class__(), null=True
+                        )
+                    elif hasattr(field_meta, "column"):
                         output_field = field_meta.__class__(null=True)
                     else:
                         output_field = field_meta.__class__()
@@ -117,10 +122,19 @@ FIELD_MAP: dict[type, Callable[[], models.Field]] = {
     haystack_indexes.IntegerField: lambda: models.IntegerField(null=True),
     haystack_indexes.FloatField: lambda: models.FloatField(null=True),
     haystack_indexes.BooleanField: lambda: models.BooleanField(null=True),
+    haystack_indexes.DecimalField: lambda: models.TextField(null=True),
+    haystack_indexes.MultiValueField: lambda: ArrayField(
+        models.TextField(), default=list, null=True
+    ),
 }
 
 
 def _django_field_for(haystack_field: haystack_indexes.SearchField) -> models.Field:
+    if isinstance(haystack_field, haystack_indexes.LocationField):
+        raise NotImplementedError(
+            "LocationField requires django.contrib.gis and is not supported "
+            "by postgres-fts-backend."
+        )
     for haystack_cls, factory in FIELD_MAP.items():
         if isinstance(haystack_field, haystack_cls):
             return factory()
