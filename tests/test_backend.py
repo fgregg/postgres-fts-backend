@@ -23,8 +23,11 @@ from haystack.query import SQ, RelatedSearchQuerySet, SearchQuerySet
 from haystack.utils.loading import UnifiedIndex
 
 import postgres_fts_backend.models as models_module
-from postgres_fts_backend import validate_all_schemas
-from postgres_fts_backend.models import generate_index_models, get_index_model
+from postgres_fts_backend.models import (
+    generate_index_models,
+    get_index_model,
+    validate_all_schemas,
+)
 from tests.core.models import AnotherMockModel, MockModel, ScoreMockModel
 from tests.mocks import MockSearchResult
 from tests.search_indexes import (
@@ -1390,7 +1393,8 @@ class TestSchemaValidation(TestCase):
     def test_validate_schema_missing_table(self):
         """_validate_all_schemas should warn for a missing table."""
         with patch(
-            "postgres_fts_backend._table_name", return_value="nonexistent_table_xyz"
+            "postgres_fts_backend.models._table_name",
+            return_value="nonexistent_table_xyz",
         ):
             with pytest.warns(UserWarning, match="does not exist"):
                 validate_all_schemas()
@@ -2200,7 +2204,7 @@ class TestAdversarialInputs(TestCase):
 
     def test_remove_unindexed_model_string(self):
         """remove() for a model not in the search index raises."""
-        with pytest.raises(Exception):
+        with pytest.raises(Exception, match="auth"):
             self.backend.remove("auth.user.1")
 
     def test_remove_empty_pk(self):
@@ -2209,7 +2213,7 @@ class TestAdversarialInputs(TestCase):
 
     def test_remove_too_few_parts(self):
         """remove('just_a_string') raises — invalid format is a programming error."""
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="app_label.model_name.pk"):
             self.backend.remove("just_a_string")
 
     # --- Websearch syntax edge cases ---
@@ -2303,9 +2307,7 @@ class TestAdversarialInputs(TestCase):
         """Search matching only one model in a multi-model setup returns results."""
         # "daniel3" exists in both models via fixture data,
         # so narrow to author (only on MockModel) to get single-model results
-        result = self.backend.search(
-            "daniel3", narrow_queries=['author:"daniel3"']
-        )
+        result = self.backend.search("daniel3", narrow_queries=['author:"daniel3"'])
         assert result["hits"] > 0
         for r in result["results"]:
             assert r.model == MockModel
@@ -2342,7 +2344,7 @@ class TestAdversarialInputs(TestCase):
     def test_sqs_slice_beyond_results(self):
         """Slicing past the end of results returns empty, not error."""
         sqs = SearchQuerySet().all()
-        sliced = list(sqs[99999:99999 + 10])
+        sliced = list(sqs[99999 : 99999 + 10])
         assert sliced == []
 
     def test_sqs_order_then_filter(self):
@@ -2386,7 +2388,10 @@ class TestAdversarialInputs(TestCase):
         self.backend.update(self.index, MockModel.objects.all())
         self.backend.update(self.index, MockModel.objects.all())
         result = self.backend.search("*")
-        assert result["hits"] == MockModel.objects.count() + AnotherMockModel.objects.count()
+        assert (
+            result["hits"]
+            == MockModel.objects.count() + AnotherMockModel.objects.count()
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2458,8 +2463,8 @@ class TestSearchCorrectness(TestCase):
                 "pk", flat=True
             )
         )
-        sqs = SearchQuerySet().models(MockModel).filter(
-            author__in=["daniel1", "daniel2"]
+        sqs = (
+            SearchQuerySet().models(MockModel).filter(author__in=["daniel1", "daniel2"])
         )
         result_pks = {int(r.pk) for r in sqs}
         assert result_pks == expected_pks
@@ -2493,8 +2498,10 @@ class TestSearchCorrectness(TestCase):
                 "pk", flat=True
             )
         )
-        sqs = SearchQuerySet().models(MockModel).filter(
-            author__exact="daniel3", pub_date__lt=cutoff
+        sqs = (
+            SearchQuerySet()
+            .models(MockModel)
+            .filter(author__exact="daniel3", pub_date__lt=cutoff)
         )
         result_pks = {int(r.pk) for r in sqs}
         assert result_pks == expected_pks
@@ -2617,9 +2624,9 @@ class TestSearchCorrectness(TestCase):
         facet_dict = dict(results["facets"]["fields"]["author"])
         for author in ["daniel1", "daniel2", "daniel3"]:
             expected = MockModel.objects.filter(author=author).count()
-            assert facet_dict[author] == expected, (
-                f"Facet count for {author}: expected {expected}, got {facet_dict[author]}"
-            )
+            assert (
+                facet_dict[author] == expected
+            ), f"Facet count for {author}: expected {expected}, got {facet_dict[author]}"
 
     def test_facet_sorted_by_count_desc(self):
         """Facet values should be sorted by count descending."""
@@ -2640,7 +2647,10 @@ class TestSearchCorrectness(TestCase):
         page_size = 3
         while offset < full["hits"]:
             page = self.backend.search(
-                "*", models=[MockModel], start_offset=offset, end_offset=offset + page_size
+                "*",
+                models=[MockModel],
+                start_offset=offset,
+                end_offset=offset + page_size,
             )
             for r in page["results"]:
                 reassembled_pks.add(r.pk)

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import warnings
 from collections.abc import Callable, Iterator
 from typing import Any
 
 from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVectorField
-from django.db import models
+from django.db import connection, models
 from django.db.models import Value
 from haystack import connections as haystack_connections
 from haystack import indexes as haystack_indexes
@@ -211,3 +212,54 @@ def generate_index_models() -> dict[type[models.Model], type[models.Model]]:
         source_model: _build_index_model(source_model, search_index)
         for source_model, search_index in ui.get_indexes().items()
     }
+
+
+def _table_name(model: type[models.Model]) -> str:
+    return f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
+
+
+def validate_all_schemas() -> None:
+    """Validate all index tables at startup. Called from AppConfig.ready()."""
+    try:
+        ui = haystack_connections["default"].get_unified_index()
+        existing_tables = connection.introspection.table_names()
+    except Exception:
+        warnings.warn(
+            "Could not connect to database to validate index schemas. "
+            "Run 'manage.py build_postgres_schema' then "
+            "'manage.py migrate postgres_fts_backend' once the database is available."
+        )
+        return
+
+    for model, index in ui.get_indexes().items():
+        table = _table_name(model)
+
+        if table not in existing_tables:
+            warnings.warn(
+                f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
+                "then 'manage.py migrate postgres_fts_backend'."
+            )
+            continue
+
+        expected_columns = {"id", "django_id", "django_ct", "search_vector"}
+        for field_name in index.fields:
+            if field_name not in ("django_ct", "django_id"):
+                expected_columns.add(field_name)
+
+        with connection.cursor() as cursor:
+            db_columns = {
+                info.name
+                for info in connection.introspection.get_table_description(
+                    cursor, table
+                )
+            }
+
+        missing = expected_columns - db_columns
+        if missing:
+            warnings.warn(
+                "Index table '{}' schema is out of date (missing columns: {}). "
+                "Run 'manage.py build_postgres_schema' then "
+                "'manage.py migrate postgres_fts_backend'.".format(
+                    table, ", ".join(sorted(missing))
+                )
+            )

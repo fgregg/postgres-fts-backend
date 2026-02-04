@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import re
-import warnings
 from typing import Any, NotRequired, TypedDict
 
 from django.apps import apps as django_apps
@@ -13,7 +12,7 @@ from django.contrib.postgres.search import (
     SearchVector,
 )
 from django.core.exceptions import FieldDoesNotExist, FieldError
-from django.db import DatabaseError, connection, models
+from django.db import DatabaseError, models
 from django.db.models import Count, F, FloatField, Q, Value
 from django.db.models.functions import Trunc
 from django.utils.encoding import force_str
@@ -61,57 +60,6 @@ default_app_config = "postgres_fts_backend.apps.PostgresFTSConfig"
 log = logging.getLogger("haystack")
 
 
-def _table_name(model: type[models.Model]) -> str:
-    return f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
-
-
-def validate_all_schemas() -> None:
-    """Validate all index tables at startup. Called from AppConfig.ready()."""
-    try:
-        ui = connections["default"].get_unified_index()
-        existing_tables = connection.introspection.table_names()
-    except Exception:
-        warnings.warn(
-            "Could not connect to database to validate index schemas. "
-            "Run 'manage.py build_postgres_schema' then "
-            "'manage.py migrate postgres_fts_backend' once the database is available."
-        )
-        return
-
-    for model, index in ui.get_indexes().items():
-        table = _table_name(model)
-
-        if table not in existing_tables:
-            warnings.warn(
-                f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
-                "then 'manage.py migrate postgres_fts_backend'."
-            )
-            continue
-
-        expected_columns = {"id", "django_id", "django_ct", "search_vector"}
-        for field_name in index.fields:
-            if field_name not in ("django_ct", "django_id"):
-                expected_columns.add(field_name)
-
-        with connection.cursor() as cursor:
-            db_columns = {
-                info.name
-                for info in connection.introspection.get_table_description(
-                    cursor, table
-                )
-            }
-
-        missing = expected_columns - db_columns
-        if missing:
-            warnings.warn(
-                "Index table '{}' schema is out of date (missing columns: {}). "
-                "Run 'manage.py build_postgres_schema' then "
-                "'manage.py migrate postgres_fts_backend'.".format(
-                    table, ", ".join(sorted(missing))
-                )
-            )
-
-
 def _field_names(index: SearchIndex) -> list[str]:
     return [name for name in index.fields if name not in ("django_ct", "django_id")]
 
@@ -120,13 +68,6 @@ def _resolve_field_name(field_name: str) -> str:
     if field_name.endswith("_exact"):
         return field_name[:-6]
     return field_name
-
-
-def _parse_narrow_query(query_string: str) -> tuple[str, str] | None:
-    match = re.match(r'^(\w+):"(.+)"$', query_string)
-    if not match:
-        return None
-    return match.group(1), match.group(2)
 
 
 class IndexSearch:
@@ -219,11 +160,11 @@ class IndexSearch:
 
     def narrow(self, narrow_queries: list[str]) -> None:
         for nq in narrow_queries:
-            parsed = _parse_narrow_query(nq)
-            if parsed is None:
+            match = re.match(r'^(\w+):"(.+)"$', nq)
+            if not match:
                 self.qs = self.qs.none()
                 return
-            field, value = parsed
+            field, value = match.group(1), match.group(2)
             col = _resolve_field_name(field)
             try:
                 self.qs.model._meta.get_field(col)
@@ -726,11 +667,13 @@ class ORMSearchQuery(BaseSearchQuery):
             return query_fragment
 
         words = query_fragment.split()
-        cleaned_words = [w for w in words if w.upper() not in self.backend.RESERVED_WORDS]
+        cleaned_words = [
+            w for w in words if w.upper() not in self.backend.RESERVED_WORDS
+        ]
         return " ".join(cleaned_words)
 
     def build_not_query(self, query_string):
-        return "-%s" % query_string
+        return f"-{query_string}"
 
     def build_query_fragment(self, field, filter_type, value):
         if hasattr(value, "prepare"):

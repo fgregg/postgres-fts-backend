@@ -6,6 +6,6 @@ class PostgresFTSConfig(AppConfig):
     default_auto_field = "django.db.models.AutoField"
 
     def ready(self):
-        from postgres_fts_backend import validate_all_schemas  # noqa: PLC0415
+        from postgres_fts_backend.models import validate_all_schemas  # noqa: PLC0415
 
         validate_all_schemas()
