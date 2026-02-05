@@ -1795,6 +1795,193 @@ class TestMultipleNarrows(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Range narrowing and date facets
+# ---------------------------------------------------------------------------
+
+
+class TestRangeNarrow(TestCase):
+    """Tests for field:[start TO end] range narrow syntax."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_datetime_range_narrows_results(self):
+        """Narrowing by a datetime range returns only docs within the range."""
+        # All fixture pub_dates are in 2009; narrow to July 2009 only
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow("pub_date:[2009-07-01T00:00:00Z TO 2009-08-01T00:00:00Z]")
+        )
+        for result in sqs:
+            obj = MockModel.objects.get(pk=result.pk)
+            assert obj.pub_date.month == 7
+            assert obj.pub_date.year == 2009
+
+    def test_datetime_range_count(self):
+        """Range narrow returns the expected number of hits."""
+        july_count = MockModel.objects.filter(
+            pub_date__gte=datetime(2009, 7, 1),
+            pub_date__lt=datetime(2009, 8, 1),
+        ).count()
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow("pub_date:[2009-07-01T00:00:00Z TO 2009-08-01T00:00:00Z]")
+        )
+        assert len(sqs) == july_count
+
+    def test_open_start_range(self):
+        """Wildcard start (* TO end) returns everything before end."""
+        sqs = SearchQuerySet().all().narrow("pub_date:[* TO 2009-07-01T00:00:00Z]")
+        for result in sqs:
+            obj = MockModel.objects.get(pk=result.pk)
+            assert obj.pub_date < datetime(2009, 7, 1)
+
+    def test_open_end_range(self):
+        """Wildcard end (start TO *) returns everything from start onward."""
+        sqs = SearchQuerySet().all().narrow("pub_date:[2009-07-17T06:00:00Z TO *]")
+        for result in sqs:
+            obj = MockModel.objects.get(pk=result.pk)
+            assert obj.pub_date >= datetime(2009, 7, 17, 6, 0, 0)
+
+    def test_fully_open_range_returns_all(self):
+        """Wildcard on both sides (* TO *) returns everything."""
+        total = SearchQuerySet().all().count()
+        sqs = SearchQuerySet().all().narrow("pub_date:[* TO *]")
+        assert len(sqs) == total
+
+    def test_range_narrow_unknown_field(self):
+        """Range narrow on a nonexistent field returns no results."""
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow("bogus_field:[2009-01-01T00:00:00Z TO 2010-01-01T00:00:00Z]")
+        )
+        assert len(sqs) == 0
+
+    def test_range_stacked_with_exact_narrow(self):
+        """Range narrow and exact narrow can be combined."""
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow('author:"daniel1"')
+            .narrow("pub_date:[2009-07-01T00:00:00Z TO 2009-08-01T00:00:00Z]")
+        )
+        for result in sqs:
+            obj = MockModel.objects.get(pk=result.pk)
+            assert obj.author == "daniel1"
+            assert obj.pub_date.month == 7
+
+
+class TestRangeNarrowDateField(TestCase):
+    """Tests for range narrowing on DateField (not DateTimeField)."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.allfields_index = AllFieldsSearchIndex()
+        backend_setup(self, [self.allfields_index])
+        self.backend.update(self.allfields_index, AllFieldsModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_date_range_narrows_results(self):
+        """Range narrow on a DateField returns only docs within the range."""
+        # Fixture dates: 2024-01-15, 2024-06-20, 2024-12-01
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow("created_date:[2024-06-01T00:00:00Z TO 2024-07-01T00:00:00Z]")
+        )
+        assert len(sqs) == 1
+        obj = AllFieldsModel.objects.get(pk=sqs[0].pk)
+        assert obj.created_date == date(2024, 6, 20)
+
+    def test_date_range_strips_time_component(self):
+        """ISO datetime strings are coerced to date for DateField comparison."""
+        sqs = (
+            SearchQuerySet()
+            .all()
+            .narrow("created_date:[2024-01-01T00:00:00Z TO 2025-01-01T00:00:00Z]")
+        )
+        assert len(sqs) == 3  # all three fixture rows
+
+
+class TestDateFacets(TestCase):
+    """Tests for date_facet bucketing."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_date_facet_monthly_buckets(self):
+        """Monthly date facets return correct bucket counts."""
+        results = self.backend.search(
+            "*",
+            date_facets={
+                "pub_date": {
+                    "start_date": datetime(2009, 1, 1),
+                    "end_date": datetime(2010, 1, 1),
+                    "gap_by": "month",
+                }
+            },
+        )
+        buckets = results["facets"]["dates"]["pub_date"]
+        total = sum(count for _, count in buckets)
+        assert total == MockModel.objects.count()
+
+    def test_date_facet_bucket_values_are_datetimes(self):
+        """Each bucket key should be a datetime."""
+        results = self.backend.search(
+            "*",
+            date_facets={
+                "pub_date": {
+                    "start_date": datetime(2009, 1, 1),
+                    "end_date": datetime(2010, 1, 1),
+                    "gap_by": "month",
+                }
+            },
+        )
+        for bucket_date, _ in results["facets"]["dates"]["pub_date"]:
+            assert isinstance(bucket_date, datetime)
+
+    def test_date_facet_respects_range(self):
+        """Date facets only count records within the start/end range."""
+        results = self.backend.search(
+            "*",
+            date_facets={
+                "pub_date": {
+                    "start_date": datetime(2009, 7, 1),
+                    "end_date": datetime(2009, 7, 18),
+                    "gap_by": "day",
+                }
+            },
+        )
+        buckets = results["facets"]["dates"]["pub_date"]
+        total = sum(count for _, count in buckets)
+        expected = MockModel.objects.filter(
+            pub_date__gte=datetime(2009, 7, 1),
+            pub_date__lt=datetime(2009, 7, 18),
+        ).count()
+        assert total == expected
+
+
+# ---------------------------------------------------------------------------
 # Pickling
 # ---------------------------------------------------------------------------
 

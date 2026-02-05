@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import re
+from datetime import date, datetime
 from typing import Any, NotRequired, TypedDict
 
 from django.apps import apps as django_apps
+from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.search import (
     SearchHeadline,
@@ -13,7 +15,8 @@ from django.contrib.postgres.search import (
     SearchVector,
 )
 from django.core.exceptions import FieldDoesNotExist, FieldError
-from django.db import DatabaseError, models
+from django.db import DatabaseError
+from django.db import models as django_models
 from django.db.models import Count, F, FloatField, Func, Q, Value
 from django.db.models.functions import Trunc
 from django.utils.encoding import force_str
@@ -52,7 +55,7 @@ class SearchResponse(TypedDict):
 
 
 class _CtInfo(TypedDict):
-    model: type[models.Model]
+    model: type[django_models.Model]
     field_names: list[str]
 
 
@@ -69,6 +72,24 @@ def _resolve_field_name(field_name: str) -> str:
     if field_name.endswith("_exact"):
         return field_name[:-6]
     return field_name
+
+
+def _parse_range_value(
+    value: str, model_field: django_models.Field
+) -> str | date | datetime:
+    """Parse a range boundary value, coercing ISO datetime strings for date fields."""
+    if isinstance(model_field, django_models.DateField) and not isinstance(
+        model_field, django_models.DateTimeField
+    ):
+        # Strip time/timezone suffix from ISO datetime strings (e.g. 2024-01-01T00:00:00Z)
+        return date.fromisoformat(value[:10])
+    if isinstance(model_field, django_models.DateTimeField):
+        # Handle both 2024-01-01T00:00:00Z and 2024-01-01 formats
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is not None and not settings.USE_TZ:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    return value
 
 
 class IndexSearch:
@@ -91,7 +112,7 @@ class IndexSearch:
     @classmethod
     def from_query_string(
         cls,
-        index_model: type[models.Model],
+        index_model: type[django_models.Model],
         index: SearchIndex,
         search_config: str,
         query_string: str,
@@ -135,7 +156,7 @@ class IndexSearch:
     @classmethod
     def from_orm_query(
         cls,
-        index_model: type[models.Model],
+        index_model: type[django_models.Model],
         index: SearchIndex,
         search_config: str,
         orm_query: Q,
@@ -161,6 +182,27 @@ class IndexSearch:
 
     def narrow(self, narrow_queries: list[str]) -> None:
         for nq in narrow_queries:
+            # Range query: field:[start TO end]
+            range_match = re.match(r"^(\w+):\[(.+?) TO (.+?)\]$", nq)
+            if range_match:
+                field = range_match.group(1)
+                start, end = range_match.group(2), range_match.group(3)
+                col = _resolve_field_name(field)
+                try:
+                    model_field = self.qs.model._meta.get_field(col)
+                except FieldDoesNotExist:
+                    self.qs = self.qs.none()
+                    return
+                filters = {}
+                if start != "*":
+                    filters[f"{col}__gte"] = _parse_range_value(start, model_field)
+                if end != "*":
+                    filters[f"{col}__lt"] = _parse_range_value(end, model_field)
+                if filters:
+                    self.qs = self.qs.filter(**filters)
+                continue
+
+            # Exact match: field:"value"
             match = re.match(r'^(\w+):"(.+)"$', nq)
             if not match:
                 self.qs = self.qs.none()
@@ -322,7 +364,9 @@ class IndexSearch:
 class MultiIndexSearch:
     """Wraps multiple IndexSearch instances for cross-model search."""
 
-    def __init__(self, searches: list[tuple[IndexSearch, type[models.Model]]]) -> None:
+    def __init__(
+        self, searches: list[tuple[IndexSearch, type[django_models.Model]]]
+    ) -> None:
         self.searches = searches
 
     def count(self) -> int:
@@ -636,7 +680,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
 
     def more_like_this(
         self,
-        model_instance: models.Model,
+        model_instance: django_models.Model,
         additional_query_string: str | None = None,
         **kwargs: Any,
     ) -> None:
