@@ -3314,3 +3314,56 @@ class TestNgramAutocomplete(TestCase):
         # NgramField matches a substring even mid-word.
         sqs = SearchQuerySet().models(AllFieldsModel).autocomplete(name_ngram="ing")
         assert "Burger King" in self._names(sqs)
+
+
+# ---------------------------------------------------------------------------
+# Multi-model union column-type alignment
+# ---------------------------------------------------------------------------
+
+
+class TestMultiModelTypedColumnUnion(TestCase):
+    """Regression: when a model with a non-text column (integer/boolean/…) is
+    NOT the first leg of the union, the filler NULLs in the earlier text-only
+    legs are typed ``text`` by Postgres and clash with the real column type
+    ("UNION types text and integer cannot be matched"). The filler must be an
+    explicitly-typed ``CAST(NULL AS <type>)``.
+
+    Order matters: if the typed model is first, Postgres fixes the column type
+    from that leg and the later NULLs resolve cleanly — which is why this must
+    place ``AllFieldsModel`` (integer/boolean/float/…) *last*.
+    """
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        backend_setup(
+            self,
+            [AllFieldsSearchIndex(), MockSearchIndex(), AnotherMockSearchIndex()],
+        )
+        AllFieldsModel.objects.create(
+            name="alpha",
+            is_active=True,
+            count=1,
+            rating=0,
+            price=0,
+            created_date=date(2020, 1, 1),
+            created_at=datetime(2020, 1, 1),
+        )
+        self.backend.update(AllFieldsSearchIndex(), AllFieldsModel.objects.all())
+        self.backend.update(MockSearchIndex(), MockModel.objects.all())
+        self.backend.update(AnotherMockSearchIndex(), AnotherMockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_typed_column_model_last_in_union(self):
+        # Text-only models first (their integer/boolean columns are filler
+        # NULLs), the typed model last.
+        union = (
+            get_index_model(MockModel)
+            .objects.all()
+            .aligned_union(get_index_model(AnotherMockModel).objects.all())
+            .aligned_union(get_index_model(AllFieldsModel).objects.all())
+        )
+        rows = list(union.order_by("django_ct", "django_id"))
+        assert len(rows) >= 1

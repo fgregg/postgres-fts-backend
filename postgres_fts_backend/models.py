@@ -9,6 +9,7 @@ from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVectorField
 from django.db import connection, models
 from django.db.models import Value
+from django.db.models.functions import Cast
 from haystack import connections as haystack_connections
 from haystack import indexes as haystack_indexes
 
@@ -93,7 +94,13 @@ class AlignedUnionQuerySet:
                         output_field = field_meta.__class__(null=True)
                     else:
                         output_field = field_meta.__class__()
-                    annotations[col_name] = Value(None, output_field=output_field)
+                    # CAST so the filler renders as ``CAST(NULL AS <type>)``
+                    # rather than a bare ``NULL``. Postgres types a bare NULL as
+                    # ``text``; if such a filler appears in an earlier union leg
+                    # than the leg with the real (e.g. integer) column, the
+                    # column type is fixed to text and the union fails with
+                    # "UNION types text and integer cannot be matched".
+                    annotations[col_name] = Cast(Value(None), output_field=output_field)
                 qs = qs.annotate(**annotations)
             aligned.append(qs.values(*sorted_cols))
 
