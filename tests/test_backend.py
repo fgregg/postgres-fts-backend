@@ -45,6 +45,7 @@ from tests.core.models import (
     AllFieldsModel,
     AnotherMockModel,
     MockModel,
+    MockTag,
     ScoreMockModel,
 )
 from tests.mocks import MockSearchResult
@@ -3209,3 +3210,107 @@ class TestSearchFieldTypes(TestCase):
         """LocationField raises NotImplementedError."""
         with pytest.raises(NotImplementedError, match="LocationField"):
             _django_field_for(haystack_indexes.LocationField())
+
+
+# ---------------------------------------------------------------------------
+# Multi-model faceting regression
+#
+# The multi-model facet-merge path was first exercised by a consumer that
+# facets several models together on a field that is null for some records.
+# Sorting the merged counts crashed when a null value tied in count with a
+# real value (None vs str comparison).
+# ---------------------------------------------------------------------------
+
+
+class TestMultiModelFacetNullSort(TestCase):
+    """Regression: merging facet counts across models raised
+    "'<' not supported between instances of 'NoneType' and 'str'" when sorting,
+    because a null facet value tied in count with a real value. ``region`` is
+    "west" for the *1 authors and null for the *2 authors; with two of each the
+    None bucket ties with "west", forcing a None-vs-str comparison in the
+    merge sort."""
+
+    def setUp(self):
+        backend_setup(self, [MockSearchIndex(), AnotherMockSearchIndex()])
+        tag = MockTag.objects.create(name="tag")
+        for author in ("a1", "b1", "c2", "d2"):  # *1 -> "west", *2 -> None
+            MockModel.objects.create(author=author, foo="findme", tag=tag)
+        self.backend.update(MockSearchIndex(), MockModel.objects.all())
+        self.backend.update(AnotherMockSearchIndex(), AnotherMockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_facet_merge_handles_null_tied_with_value(self):
+        counts = (
+            SearchQuerySet()
+            .models(MockModel, AnotherMockModel)
+            .auto_query("findme")
+            .facet("region")
+            .facet_counts()
+        )
+        region = dict(counts["fields"]["region"])
+        assert region.get("west") == 2
+        assert region.get(None) == 2
+
+
+# ---------------------------------------------------------------------------
+# N-gram autocomplete (edge = word-prefix, full = substring)
+# ---------------------------------------------------------------------------
+
+
+class TestNgramAutocomplete(TestCase):
+    """Autocomplete on n-gram fields, accelerated by the field's trigram index.
+
+    EdgeNgramField does word-prefix matching (each query word must *begin* a
+    word in the field); NgramField does substring matching. Both catch short
+    fragments that plain trigram *similarity* would miss.
+    """
+
+    def setUp(self):
+        backend_setup(self, [AllFieldsSearchIndex()])
+        for name in ("Burger King", "Taco Bell", "Dairy Queen"):
+            AllFieldsModel.objects.create(
+                name=name,
+                is_active=True,
+                count=1,
+                rating=0,
+                price=0,
+                created_date=date(2020, 1, 1),
+                created_at=datetime(2020, 1, 1),
+            )
+        self.backend.update(AllFieldsSearchIndex(), AllFieldsModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def _names(self, sqs):
+        return {AllFieldsModel.objects.get(pk=r.pk).name for r in sqs}
+
+    def test_edge_ngram_matches_non_leading_word_prefix(self):
+        # "kin" is a prefix of the *second* word "King" — edge-ngram matches it
+        # (and trigram similarity of a 3-char fragment to "Burger King" would
+        # not clear the threshold).
+        sqs = SearchQuerySet().models(AllFieldsModel).autocomplete(name_edge="kin")
+        assert self._names(sqs) == {"Burger King"}
+
+    def test_edge_ngram_excludes_mid_word_fragment(self):
+        # "ing" sits inside "King" but does not *begin* a word — excluded.
+        sqs = SearchQuerySet().models(AllFieldsModel).autocomplete(name_edge="ing")
+        assert self._names(sqs) == set()
+
+    def test_edge_ngram_requires_every_word_to_prefix(self):
+        # Each whitespace-split fragment must begin some word.
+        both = (
+            SearchQuerySet().models(AllFieldsModel).autocomplete(name_edge="burg kin")
+        )
+        assert self._names(both) == {"Burger King"}
+        neither = (
+            SearchQuerySet().models(AllFieldsModel).autocomplete(name_edge="burg taco")
+        )
+        assert self._names(neither) == set()
+
+    def test_full_ngram_matches_substring(self):
+        # NgramField matches a substring even mid-word.
+        sqs = SearchQuerySet().models(AllFieldsModel).autocomplete(name_ngram="ing")
+        assert "Burger King" in self._names(sqs)

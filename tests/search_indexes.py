@@ -13,6 +13,9 @@ class MockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     author = indexes.CharField(model_attr="author")
     pub_date = indexes.DateTimeField(model_attr="pub_date")
     categories = indexes.MultiValueField()
+    # Nullable faceted field — null for some records, so multi-model facet
+    # merges can include a None value.
+    region = indexes.CharField(faceted=True, null=True)
 
     def get_model(self):
         return MockModel
@@ -26,13 +29,20 @@ class MockSearchIndex(indexes.SearchIndex, indexes.Indexable):
             base.append("secondary")
         return base
 
+    def prepare_region(self, obj):
+        return "west" if obj.author.endswith("1") else None
+
 
 class AnotherMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, model_attr="author")
     pub_date = indexes.DateTimeField(model_attr="pub_date")
+    region = indexes.CharField(faceted=True, null=True)
 
     def get_model(self):
         return AnotherMockModel
+
+    def prepare_region(self, obj):
+        return None
 
 
 class ScoreMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
@@ -46,6 +56,7 @@ class ScoreMockSearchIndex(indexes.SearchIndex, indexes.Indexable):
 class AllFieldsSearchIndex(indexes.SearchIndex, indexes.Indexable):
     text = indexes.CharField(document=True, model_attr="name")
     name_ngram = indexes.NgramField(model_attr="name")
+    name_edge = indexes.EdgeNgramField(model_attr="name")
     is_active = indexes.BooleanField(model_attr="is_active")
     count = indexes.IntegerField(model_attr="count")
     rating = indexes.FloatField(model_attr="rating")

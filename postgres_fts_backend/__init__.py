@@ -29,7 +29,7 @@ from haystack.backends import (
     log_query,
 )
 from haystack.constants import DJANGO_CT, DJANGO_ID
-from haystack.indexes import SearchIndex
+from haystack.indexes import EdgeNgramField, NgramField, SearchIndex
 from haystack.models import SearchResult
 from haystack.utils import get_model_ct
 
@@ -395,7 +395,11 @@ class MultiIndexSearch:
                     for value, count in sub.get("fields", {}).get(field_name, []):
                         combined_counts[value] = combined_counts.get(value, 0) + count
                 merged["fields"][field_name] = sorted(
-                    combined_counts.items(), key=lambda x: (-x[1], x[0])
+                    # ``x[0] is None`` keeps a null facet value sortable next to
+                    # real (str / int / bool) values across models, instead of
+                    # raising ``'<' not supported between str and NoneType``.
+                    combined_counts.items(),
+                    key=lambda x: (-x[1], x[0] is None, x[0]),
                 )
 
         if date_facets:
@@ -682,7 +686,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
         self,
         model_instance: django_models.Model,
         additional_query_string: str | None = None,
-        **kwargs: Any,
+        result_class=None,
     ) -> None:
         raise NotImplementedError(
             "postgres_fts_backend does not support more_like_this. "
@@ -743,6 +747,43 @@ class ORMSearchQuery(BaseSearchQuery):
                 return index.fields[field].is_multivalued
         return False
 
+    def _ngram_kind(self, field):
+        """Return ``"edge"`` if *field* is an EdgeNgramField, ``"full"`` if a
+        plain NgramField, else ``None``. EdgeNgramField subclasses NgramField,
+        so it must be checked first."""
+        ui = connections["default"].get_unified_index()
+        for index in ui.get_indexes().values():
+            field_obj = index.fields.get(field)
+            if field_obj is None:
+                continue
+            if isinstance(field_obj, EdgeNgramField):
+                return "edge"
+            if isinstance(field_obj, NgramField):
+                return "full"
+        return None
+
+    def _ngram_query(self, field, value, edge):
+        """Build an n-gram autocomplete match for *field*.
+
+        For an EdgeNgramField (``edge=True``) every query word must *begin* a
+        word in the field — a case-insensitive regex anchored at a word
+        boundary (``\\m``). For a plain NgramField it must appear anywhere — a
+        case-insensitive substring. Both lookups are accelerated by the field's
+        ``gin_trgm_ops`` index (pg_trgm supports ``~*`` / ``ILIKE``), so no
+        extra column or index is needed.
+        """
+        words = [w for w in re.split(r"\s+", str(value).strip()) if w]
+        if not words:
+            # An empty autocomplete term matches nothing rather than everything.
+            return Q(pk__in=[])
+        query = Q()
+        for word in words:
+            if edge:
+                query &= Q(**{f"{field}__iregex": r"\m" + re.escape(word)})
+            else:
+                query &= Q(**{f"{field}__icontains": word})
+        return query
+
     def build_query_fragment(self, field, filter_type, value):
         if hasattr(value, "prepare"):
             value = value.prepare(self)
@@ -759,6 +800,9 @@ class ORMSearchQuery(BaseSearchQuery):
                 )
             if self._is_multivalued(field):
                 return Q(**{f"{field}__contains": [value]})
+            ngram_kind = self._ngram_kind(field)
+            if ngram_kind is not None:
+                return self._ngram_query(field, value, edge=ngram_kind == "edge")
             return Q(**{f"{field}__trigram_similar": value})
 
         if filter_type == "fuzzy":

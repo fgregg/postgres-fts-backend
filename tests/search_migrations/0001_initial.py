@@ -35,6 +35,7 @@ class Migration(migrations.Migration):
                 ),
                 ("text", models.TextField(null=True)),
                 ("name_ngram", models.TextField(null=True)),
+                ("name_edge", models.TextField(null=True)),
                 ("is_active", models.BooleanField(null=True)),
                 ("count", models.IntegerField(null=True)),
                 ("rating", models.FloatField(null=True)),
@@ -54,6 +55,12 @@ class Migration(migrations.Migration):
                             models.F("name_ngram"), name="gin_trgm_ops"
                         ),
                         name="haystack_index_core_allfieldsmodel_name_ngram_trgm",
+                    ),
+                    django.contrib.postgres.indexes.GinIndex(
+                        django.contrib.postgres.indexes.OpClass(
+                            models.F("name_edge"), name="gin_trgm_ops"
+                        ),
+                        name="haystack_index_core_allfieldsmodel_name_edge_trgm",
                     ),
                 ],
                 "unique_together": {("django_ct", "django_id")},
@@ -79,6 +86,8 @@ class Migration(migrations.Migration):
                 ),
                 ("text", models.TextField(null=True)),
                 ("pub_date", models.DateTimeField(null=True)),
+                ("region", models.TextField(null=True)),
+                ("region_exact", models.TextField(null=True)),
             ],
             options={
                 "db_table": "haystack_index_core_anothermockmodel",
@@ -118,6 +127,8 @@ class Migration(migrations.Migration):
                         base_field=models.TextField(), default=list, null=True
                     ),
                 ),
+                ("region", models.TextField(null=True)),
+                ("region_exact", models.TextField(null=True)),
             ],
             options={
                 "db_table": "haystack_index_core_mockmodel",
