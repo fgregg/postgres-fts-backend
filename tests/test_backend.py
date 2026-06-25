@@ -3367,3 +3367,45 @@ class TestMultiModelTypedColumnUnion(TestCase):
         )
         rows = list(union.order_by("django_ct", "django_id"))
         assert len(rows) >= 1
+
+
+class TestIdempotentSchemaMigrations(TestMigrationChangeDetection):
+    """Generated migrations must survive the migration state and the physical
+    database drifting apart (index tables are regenerated, derived state)."""
+
+    def test_create_model_no_ops_when_table_already_exists(self):
+        backend_setup(self, self._all_indexes())
+        self.models_module._index_models_cache.clear()
+
+        module_name = "temp_mig_idempotent"
+        pkg_dir = self._make_migration_package(module_name, copy_initial=False)
+
+        with override_settings(MIGRATION_MODULES={"postgres_fts_backend": module_name}):
+            call_command("build_postgres_schema", verbosity=0)
+
+            # The generated initial uses the idempotent operation.
+            initial = next(
+                f
+                for f in os.listdir(pkg_dir)
+                if f.endswith(".py") and f != "__init__.py"
+            )
+            with open(os.path.join(pkg_dir, initial)) as f:
+                assert "CreateModelIfNotExists" in f.read()
+
+            call_command(
+                "migrate", "postgres_fts_backend", verbosity=0
+            )  # tables created
+
+            # Forget the migration in the recorded state but leave the tables in
+            # place, mimicking prod whose DB diverged from the history.
+            call_command(
+                "migrate", "postgres_fts_backend", "zero", fake=True, verbosity=0
+            )
+
+            # Re-applying must skip the existing tables, not raise
+            # "relation already exists" (which a plain CreateModel would).
+            call_command("migrate", "postgres_fts_backend", verbosity=0)
+
+            with connection.cursor() as cursor:
+                tables = set(connection.introspection.table_names(cursor))
+            assert "haystack_index_core_mockmodel" in tables

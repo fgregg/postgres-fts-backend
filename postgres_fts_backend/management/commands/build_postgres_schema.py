@@ -6,12 +6,34 @@ from django.contrib.postgres.operations import TrigramExtension
 from django.core.management.base import BaseCommand
 from django.db.migrations.autodetector import MigrationAutodetector
 from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.operations.models import CreateModel, DeleteModel
 from django.db.migrations.state import ModelState, ProjectState
 from django.db.migrations.writer import MigrationWriter
 
 from postgres_fts_backend.models import generate_index_models
+from postgres_fts_backend.operations import (
+    CreateModelIfNotExists,
+    DeleteModelIfExists,
+)
 
 APP_LABEL = "postgres_fts_backend"
+
+
+def _idempotent(operation):
+    """Swap CreateModel/DeleteModel for their idempotent variants so generated
+    migrations stay safe when the migration state and the physical database
+    have drifted apart (the index tables are regenerated, derived state)."""
+    if type(operation) is CreateModel:
+        return CreateModelIfNotExists(
+            name=operation.name,
+            fields=operation.fields,
+            options=operation.options,
+            bases=operation.bases,
+            managers=operation.managers,
+        )
+    if type(operation) is DeleteModel:
+        return DeleteModelIfExists(name=operation.name)
+    return operation
 
 
 class Command(BaseCommand):
@@ -75,6 +97,7 @@ class Command(BaseCommand):
                 f.write("")
 
         for migration in changes[APP_LABEL]:
+            migration.operations = [_idempotent(op) for op in migration.operations]
             if getattr(migration, "initial", False):
                 migration.operations.insert(0, TrigramExtension())
             writer = MigrationWriter(migration)
