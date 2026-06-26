@@ -8,26 +8,36 @@ from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.contrib.postgres.search import SearchQuery, SearchRank, SearchVectorField
 from django.db import connection, models
-from django.db.models import Value
+from django.db.models import ExpressionWrapper, F, FloatField, Value
 from django.db.models.functions import Cast
 from haystack import connections as haystack_connections
 from haystack import indexes as haystack_indexes
+
+
+def _rank_expr(sq: SearchQuery) -> ExpressionWrapper:
+    """Text-relevance rank scaled by the per-document ``boost`` field.
+
+    SearchRank scores the FTS ``search_vector`` match; multiplying by ``boost``
+    (a FloatField defaulting to 1.0, so a no-op for un-boosted documents) honors
+    Haystack's index-time document boost (``prepared_data['boost']``).
+    """
+    return ExpressionWrapper(
+        SearchRank("search_vector", sq, cover_density=True, normalization=32)
+        * F("boost"),
+        output_field=FloatField(),
+    )
 
 
 class IndexQuerySet(models.QuerySet):
     def search(self, search_text: str, config: str = "english") -> IndexQuerySet:
         """Full-text filter + rank annotation in one call."""
         sq = SearchQuery(search_text, search_type="websearch", config=config)
-        return self.filter(search_vector=sq).annotate(
-            rank=SearchRank("search_vector", sq, cover_density=True, normalization=32)
-        )
+        return self.filter(search_vector=sq).annotate(rank=_rank_expr(sq))
 
     def ranked(self, search_text: str, config: str = "english") -> IndexQuerySet:
         """Add rank annotation only (when filter is applied separately)."""
         sq = SearchQuery(search_text, search_type="websearch", config=config)
-        return self.annotate(
-            rank=SearchRank("search_vector", sq, cover_density=True, normalization=32)
-        )
+        return self.annotate(rank=_rank_expr(sq))
 
     def aligned_union(self, other: IndexQuerySet) -> AlignedUnionQuerySet:
         """Start a chainable aligned union with another queryset.
@@ -176,6 +186,10 @@ def _build_index_model(
         "django_id": models.CharField(max_length=255),
         "django_ct": models.CharField(max_length=255),
         "search_vector": SearchVectorField(null=True),
+        # Per-document boost (Haystack's prepared_data['boost']); multiplies the
+        # text-relevance rank in _rank_expr. Defaults to 1.0 so un-boosted
+        # documents are unaffected.
+        "boost": models.FloatField(default=1.0),
         "objects": IndexQuerySet.as_manager(),
     }
 

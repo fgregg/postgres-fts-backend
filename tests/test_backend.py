@@ -12,7 +12,12 @@ import pytest
 from django.apps import apps as global_apps
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
-from django.contrib.postgres.search import SearchQuery, SearchVectorField
+from django.contrib.postgres.search import (
+    SearchQuery,
+    SearchRank,
+    SearchVector,
+    SearchVectorField,
+)
 from django.core.exceptions import FieldError
 from django.core.management import call_command
 from django.db import DatabaseError, connection, models
@@ -3406,3 +3411,62 @@ class TestIndexNameLengthCheck(TestCase):
         assert not any(e.id == "models.E034" for e in errors), errors
         # other checks are unaffected
         assert isinstance(errors, list)
+
+
+class TestDocumentBoost(TestCase):
+    """Haystack index-time document boost (prepared_data['boost']) is stored per
+    document and multiplies the text-relevance rank."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_rank_scaled_by_boost(self):
+        Model = get_index_model(MockModel)
+        Model.objects.all().delete()
+        Model.objects.create(
+            django_ct="core.mockmodel", django_id="1", text="alpha beta", boost=1.0
+        )
+        Model.objects.create(
+            django_ct="core.mockmodel", django_id="2", text="alpha beta", boost=3.0
+        )
+        Model.objects.update(search_vector=SearchVector("text", config="english"))
+
+        ranked = {r.django_id: r.rank for r in Model.objects.search("alpha")}
+        assert ranked["2"] == pytest.approx(ranked["1"] * 3.0)
+
+    def test_default_boost_is_identity(self):
+        # Un-boosted documents default to boost 1.0, so ranking is unchanged.
+        Model = get_index_model(MockModel)
+        Model.objects.all().delete()
+        Model.objects.create(
+            django_ct="core.mockmodel", django_id="1", text="alpha beta", boost=1.0
+        )
+        Model.objects.update(search_vector=SearchVector("text", config="english"))
+        (row,) = list(Model.objects.search("alpha"))
+        bare_rank = SearchRank(
+            "search_vector",
+            SearchQuery("alpha", search_type="websearch", config="english"),
+            cover_density=True,
+            normalization=32,
+        )
+        (expected,) = Model.objects.annotate(r=bare_rank).values_list("r", flat=True)
+        assert row.rank == pytest.approx(expected)
+
+    def test_update_stores_boost(self):
+        class BoostedIndex(MockSearchIndex):
+            def prepare(self, obj):
+                data = super().prepare(obj)
+                data["boost"] = 2.0
+                return data
+
+        index = BoostedIndex()
+        self.backend.update(index, MockModel.objects.all())
+        Model = get_index_model(MockModel)
+        assert Model.objects.exists()
+        assert all(r.boost == 2.0 for r in Model.objects.all())
