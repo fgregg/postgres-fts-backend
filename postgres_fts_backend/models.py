@@ -217,6 +217,20 @@ def _build_index_model(
     attrs["Meta"] = meta
 
     model_cls = type(class_name, (models.Model,), attrs)
+
+    # The index name is derived from the (long) table name, so it can exceed
+    # Django's cross-database 30-char advisory (models.E034). These tables are
+    # Postgres-only and the names are valid there, so drop just that check. It
+    # only runs at all because the models are registered in the app registry
+    # (AppConfig.ready) to keep makemigrations from proposing destructive
+    # deletes; without that, this check never fired.
+    _base_check = model_cls.check
+
+    def _check(cls, _base_check=_base_check, **kwargs):
+        return [e for e in _base_check(**kwargs) if e.id != "models.E034"]
+
+    model_cls.check = classmethod(_check)
+
     _index_models_cache[class_name] = model_cls
     return model_cls
 

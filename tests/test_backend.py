@@ -3393,3 +3393,16 @@ class TestMakemigrationsSafety(TestCase):
             if isinstance(op, DeleteModel)
         ]
         assert not deletes, f"destructive index-model deletes proposed: {deletes}"
+
+
+class TestIndexNameLengthCheck(TestCase):
+    """The generated index names exceed Django's cross-database 30-char advisory
+    (models.E034). The index models drop just that check so it doesn't block
+    migrate now that they're registered in the app registry."""
+
+    def test_index_model_silences_e034(self):
+        model = get_index_model(MockModel)
+        errors = model.check()
+        assert not any(e.id == "models.E034" for e in errors), errors
+        # other checks are unaffected
+        assert isinstance(errors, list)
