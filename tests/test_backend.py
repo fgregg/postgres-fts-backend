@@ -9,12 +9,17 @@ from io import StringIO
 from unittest.mock import MagicMock, patch
 
 import pytest
+from django.apps import apps as global_apps
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 from django.contrib.postgres.search import SearchQuery, SearchVectorField
 from django.core.exceptions import FieldError
 from django.core.management import call_command
 from django.db import DatabaseError, connection, models
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.operations.models import DeleteModel
+from django.db.migrations.state import ProjectState
 from django.db.models import FloatField, Value
 from django.test import TestCase, override_settings
 from haystack import connections
@@ -3367,3 +3372,24 @@ class TestMultiModelTypedColumnUnion(TestCase):
         )
         rows = list(union.order_by("django_ct", "django_id"))
         assert len(rows) >= 1
+
+
+class TestMakemigrationsSafety(TestCase):
+    """The dynamic index models are registered at app-ready, so a plain
+    ``makemigrations`` (the standard autodetector run against the app registry)
+    sees them as existing and does not propose destructive DeleteModel
+    operations for the index tables."""
+
+    def test_autodetector_proposes_no_index_model_deletes(self):
+        loader = MigrationLoader(None, ignore_no_migrations=True)
+        autodetector = MigrationAutodetector(
+            loader.project_state(), ProjectState.from_apps(global_apps)
+        )
+        changes = autodetector.changes(graph=loader.graph)
+        deletes = [
+            op
+            for migration in changes.get("postgres_fts_backend", [])
+            for op in migration.operations
+            if isinstance(op, DeleteModel)
+        ]
+        assert not deletes, f"destructive index-model deletes proposed: {deletes}"
