@@ -347,6 +347,10 @@ class IndexSearch:
             stored_fields = {fn: getattr(obj, fn) for fn in field_names}
             # 'score' is a reserved positional arg of SearchResult.__init__
             stored_fields.pop("score", None)
+            # Haystack document id ("app.model.pk"). update_index --remove reads
+            # it via values_list("pk", "id") and passes it back to remove(), so
+            # without it stale-record purging silently no-ops on a None id.
+            stored_fields["id"] = f"{app_label}.{model_name}.{obj.django_id}"
             if self.highlight_field:
                 headline = getattr(obj, "headline", None)
                 if headline:
@@ -486,6 +490,11 @@ class MultiIndexSearch:
             stored_fields = {fn: row.get(fn) for fn in info["field_names"]}
             # 'score' is a reserved positional arg of SearchResult.__init__
             stored_fields.pop("score", None)
+            # Haystack document id ("app.model.pk"); see the single-model note.
+            stored_fields["id"] = (
+                f"{model._meta.app_label}.{model._meta.model_name}."
+                f"{row['django_id']}"
+            )
 
             if highlight_field and "headline" in row and row["headline"]:
                 stored_fields["highlighted"] = {highlight_field: [row["headline"]]}

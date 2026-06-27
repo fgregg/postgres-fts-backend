@@ -3470,3 +3470,39 @@ class TestDocumentBoost(TestCase):
         Model = get_index_model(MockModel)
         assert Model.objects.exists()
         assert all(r.boost == 2.0 for r in Model.objects.all())
+
+
+class TestSearchResultDocumentId(TestCase):
+    """Results must expose the Haystack document id ('app.model.pk'), which
+    `update_index --remove` reads via values_list('pk', 'id') to identify and
+    delete stale records. Without it the id is None, the stale set collapses to
+    a single None, and removal silently no-ops."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_results_expose_haystack_document_id(self):
+        results = self.backend.search("indexing")["results"]
+        assert results
+        for r in results:
+            assert r.id == f"core.mockmodel.{r.pk}"
+
+    def test_update_index_remove_purges_stale_records(self):
+        Model = get_index_model(MockModel)
+        # A document whose source row no longer exists in the database.
+        Model.objects.create(
+            django_ct="core.mockmodel", django_id="999999", text="stale", boost=1.0
+        )
+        live_before = Model.objects.exclude(django_id="999999").count()
+
+        call_command("update_index", remove=True, verbosity=0)
+
+        assert not Model.objects.filter(django_id="999999").exists()
+        assert Model.objects.count() == live_before
