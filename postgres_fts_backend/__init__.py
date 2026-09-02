@@ -191,6 +191,8 @@ class IndexSearch:
                 try:
                     model_field = self.qs.model._meta.get_field(col)
                 except FieldDoesNotExist:
+                    # As below: an absent field excludes this model from a
+                    # multi-model search rather than being a caller error.
                     self.qs = self.qs.none()
                     return
                 filters = {}
@@ -202,22 +204,31 @@ class IndexSearch:
                     self.qs = self.qs.filter(**filters)
                 continue
 
-            # Exact match: field:"value"
-            match = re.match(r'^(\w+):"(.+)"$', nq)
+            # Exact match, quoted or bare: field:"value" or field:value.
+            # Solr and the Haystack docs both use the bare form, so accept it.
+            match = re.match(r'^(\w+):"(.*)"$', nq) or re.match(r"^(\w+):(\S+)$", nq)
             if not match:
-                self.qs = self.qs.none()
-                return
+                raise ValueError(
+                    f"Cannot parse narrow query {nq!r}. Expected "
+                    'field:"value", field:value, or field:[start TO end].'
+                )
             field, value = match.group(1), match.group(2)
             col = _resolve_field_name(field)
             try:
                 model_field = self.qs.model._meta.get_field(col)
             except FieldDoesNotExist:
+                # Not an error: narrow() runs against each model's index in a
+                # multi-model search, and a field that exists on only some of
+                # them should exclude the rest. Only an unparseable query is a
+                # caller mistake.
                 self.qs = self.qs.none()
                 return
             if isinstance(model_field, ArrayField):
                 self.qs = self.qs.filter(**{f"{col}__contains": [value]})
             else:
-                self.qs = self.qs.filter(**{col: value})
+                self.qs = self.qs.filter(
+                    **{col: _coerce_narrow_value(model_field, value)}
+                )
 
     def highlight(self) -> None:
         if self.search_text is None:
@@ -731,6 +742,29 @@ class ORMSearchNode(SearchNode):
         return query
 
 
+# Solr and Elasticsearch spell booleans "true"/"false" in query syntax, and so
+# does most code written against Haystack. Django's BooleanField.to_python
+# accepts "True" but rejects "true", so a narrow query written for another
+# backend would raise ValidationError here. Normalise instead.
+_TRUE = frozenset({"true", "t", "1", "yes"})
+_FALSE = frozenset({"false", "f", "0", "no"})
+
+
+def _coerce_narrow_value(model_field: django_models.Field, value: str) -> Any:
+    """A narrow query's string value, in the type its column expects."""
+    if isinstance(model_field, django_models.BooleanField):
+        lowered = value.strip().lower()
+        if lowered in _TRUE:
+            return True
+        if lowered in _FALSE:
+            return False
+        raise ValueError(
+            f"Cannot narrow boolean field {model_field.name!r} on {value!r}; "
+            "expected true or false."
+        )
+    return value
+
+
 class ORMSearchQuery(BaseSearchQuery):
 
     def __init__(self, using="default"):
@@ -865,10 +899,32 @@ class ORMSearchQuery(BaseSearchQuery):
         self._facet_counts = self.post_process_facets(results)
         self._spelling_suggestion = results.get("spelling_suggestion", None)
 
-    def get_count(self):
-        if self._hit_count is None:
+    def get_count(self) -> int:
+        """Hit count without fetching the hits.
+
+        ``BaseSearchQuery.get_count`` sets ``end_offset = 1`` first, precisely
+        so that counting does not consume the whole result set. Overriding it
+        without that window made ``.count()`` build a ``SearchResult`` for
+        every match to return one integer -- 4.6s on a 28k-row index against
+        24ms for the equivalent COUNT(*), and unbounded memory in the size of
+        the result set rather than the page.
+        """
+        return super().get_count()
+
+    def get_facet_counts(self) -> FacetResults:
+        """Facet counts without fetching the hits.
+
+        Facets are computed by their own GROUP BY queries against the filtered
+        queryset and do not read the hydrated results, so the same one-row
+        window the base class uses for counting applies here too. The base
+        class runs unwindowed, which is reasonable for Solr -- facets ride back
+        with the results there -- but pure waste for this backend.
+        """
+        if self._facet_counts is None:
+            if not self.end_offset:
+                self.end_offset = 1
             self.run()
-        return self._hit_count
+        return self._facet_counts
 
 
 class PostgresFTSEngine(BaseEngine):

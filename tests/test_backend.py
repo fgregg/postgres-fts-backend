@@ -2384,15 +2384,25 @@ class TestAdversarialInputs(TestCase):
 
     # --- Narrow query parsing ---
 
-    def test_malformed_narrow_query(self):
-        """A narrow query that doesn't match field:"value" should not crash."""
-        result = self.backend.search("*", narrow_queries=["not a valid narrow"])
-        assert result["hits"] == 0 or result["results"] == []
+    def test_malformed_narrow_query_raises(self):
+        """An unparseable narrow query is a caller error, and says so.
 
-    def test_narrow_query_missing_quotes(self):
-        """Narrow query without quotes should not crash."""
-        result = self.backend.search("*", narrow_queries=["author:daniel1"])
-        assert result["hits"] == 0 or result["results"] == []
+        It used to return an empty result set, which is indistinguishable from
+        a legitimate "nothing matched" -- so a typo produced plausible-looking
+        wrong numbers instead of an exception.
+        """
+        with pytest.raises(ValueError, match="Cannot parse narrow query"):
+            self.backend.search("*", narrow_queries=["not a valid narrow"])
+
+    def test_narrow_query_without_quotes_is_honoured(self):
+        """Solr and the Haystack docs both use the bare field:value form.
+
+        It used to be unparseable, and so returned nothing at all.
+        """
+        bare = self.backend.search("*", narrow_queries=["author:daniel1"])
+        quoted = self.backend.search("*", narrow_queries=['author:"daniel1"'])
+        assert bare["hits"] == quoted["hits"]
+        assert {r.pk for r in bare["results"]} == {r.pk for r in quoted["results"]}
 
     def test_narrow_query_empty_value(self):
         """Narrow query with empty quoted value should not crash."""
@@ -3506,3 +3516,78 @@ class TestSearchResultDocumentId(TestCase):
 
         assert not Model.objects.filter(django_id="999999").exists()
         assert Model.objects.count() == live_before
+
+
+# ---------------------------------------------------------------------------
+# Narrow value coercion, and counting without consuming the results
+# ---------------------------------------------------------------------------
+
+
+class TestBooleanNarrow(TestCase):
+    """Solr and Elasticsearch spell booleans lowercase in query syntax."""
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.allfields_index = AllFieldsSearchIndex()
+        backend_setup(self, [self.allfields_index])
+        self.backend.update(self.allfields_index, AllFieldsModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_lowercase_boolean_narrow(self):
+        """Django's BooleanField rejects "true"; a narrow query should not."""
+        lower = self.backend.search("*", narrow_queries=['is_active:"true"'])
+        upper = self.backend.search("*", narrow_queries=['is_active:"True"'])
+        assert lower["hits"] == upper["hits"]
+
+    def test_lowercase_boolean_narrow_bare(self):
+        bare = self.backend.search("*", narrow_queries=["is_active:true"])
+        quoted = self.backend.search("*", narrow_queries=['is_active:"True"'])
+        assert bare["hits"] == quoted["hits"]
+
+    def test_false_narrows_separately_from_true(self):
+        true_hits = self.backend.search("*", narrow_queries=["is_active:true"])["hits"]
+        false_hits = self.backend.search("*", narrow_queries=["is_active:false"])["hits"]
+        total = self.backend.search("*")["hits"]
+        assert true_hits + false_hits == total
+
+    def test_unparseable_boolean_raises(self):
+        with pytest.raises(ValueError, match="expected true or false"):
+            self.backend.search("*", narrow_queries=['is_active:"maybe"'])
+
+
+class TestCountingIsCheap(TestCase):
+    """count() and facet_counts() must not fetch every hit to answer.
+
+    BaseSearchQuery.get_count sets end_offset = 1 first, "so we get a count
+    without consuming everything". Overriding it without that window made
+    counting O(result set) in time and memory: a query matching a million rows
+    built a million SearchResults to return the number one million.
+    """
+
+    fixtures = ["bulk_data.json"]
+
+    def setUp(self):
+        self.index = MockSearchIndex()
+        backend_setup(self, [self.index])
+        self.backend.update(self.index, MockModel.objects.all())
+
+    def tearDown(self):
+        backend_teardown(self)
+
+    def test_count_is_correct(self):
+        assert SearchQuerySet().all().count() == MockModel.objects.count()
+
+    def test_count_does_not_materialise_every_hit(self):
+        sqs = SearchQuerySet().all()
+        assert sqs.count() > 1
+        # None (nothing fetched) or the single-row window the base class takes.
+        assert not sqs.query._results or len(sqs.query._results) <= 1
+
+    def test_facet_counts_do_not_materialise_every_hit(self):
+        sqs = SearchQuerySet().all().facet("author")
+        counts = sqs.facet_counts()["fields"]["author"]
+        assert sum(n for _, n in counts) == MockModel.objects.count()
+        assert not sqs.query._results or len(sqs.query._results) <= 1
