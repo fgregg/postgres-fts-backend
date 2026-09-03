@@ -766,6 +766,9 @@ def _coerce_narrow_value(model_field: django_models.Field, value: str) -> Any:
 
 
 class ORMSearchQuery(BaseSearchQuery):
+    # ``BaseSearchQuery.__init__`` is unannotated, so mypy skips its body and
+    # cannot infer a type for the offsets it sets. Redeclare it here.
+    end_offset: int | None
 
     def __init__(self, using="default"):
         super().__init__(using=using)

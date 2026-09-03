@@ -3549,7 +3549,9 @@ class TestBooleanNarrow(TestCase):
 
     def test_false_narrows_separately_from_true(self):
         true_hits = self.backend.search("*", narrow_queries=["is_active:true"])["hits"]
-        false_hits = self.backend.search("*", narrow_queries=["is_active:false"])["hits"]
+        false_hits = self.backend.search("*", narrow_queries=["is_active:false"])[
+            "hits"
+        ]
         total = self.backend.search("*")["hits"]
         assert true_hits + false_hits == total
 
