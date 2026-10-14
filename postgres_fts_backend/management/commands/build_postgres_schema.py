@@ -30,9 +30,10 @@ class Command(BaseCommand):
 
         # Build the target state from the dynamic models
         new_state = ProjectState()
-        for model_cls in index_models.values():
-            model_state = ModelState.from_model(model_cls)
-            new_state.add_model(model_state)
+        for connection_models in index_models.values():
+            for model_cls in connection_models.values():
+                model_state = ModelState.from_model(model_cls)
+                new_state.add_model(model_state)
 
         # Load existing migrations to get the current state
         loader = MigrationLoader(None, ignore_no_migrations=True)

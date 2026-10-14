@@ -14,6 +14,16 @@ from haystack import connections as haystack_connections
 from haystack import indexes as haystack_indexes
 
 
+def postgres_fts_backend_connection_names() -> list[str]:
+    """Returns the connection names using PostgresFTSEngine."""
+    return [
+        name
+        for name in haystack_connections.connections_info
+        if haystack_connections[name].options.get("ENGINE", "")
+        == "postgres_fts_backend.PostgresFTSEngine"
+    ]
+
+
 def _rank_expr(sq: SearchQuery) -> ExpressionWrapper:
     """Text-relevance rank scaled by the per-document ``boost`` field.
 
@@ -171,12 +181,16 @@ _index_models_cache: dict[str, type[models.Model]] = {}
 
 
 def _build_index_model(
-    source_model: type[models.Model], search_index: haystack_indexes.SearchIndex
+    source_model: type[models.Model],
+    search_index: haystack_indexes.SearchIndex,
+    connection_name: str,
 ) -> type[models.Model]:
     app_label: str = source_model._meta.app_label
     model_name: str = source_model._meta.model_name  # type: ignore[assignment]
 
     class_name = f"HaystackIndex_{app_label.capitalize()}_{model_name.capitalize()}"
+    if connection_name != "default":
+        class_name = f"{class_name}_{connection_name}"
 
     if class_name in _index_models_cache:
         return _index_models_cache[class_name]
@@ -199,6 +213,8 @@ def _build_index_model(
         attrs[field_name] = _django_field_for(field_obj)
 
     table_name = f"haystack_index_{app_label}_{model_name}"
+    if connection_name != "default":
+        table_name = f"{table_name}_{connection_name}"
 
     db_indexes = [
         GinIndex(
@@ -249,66 +265,80 @@ def _build_index_model(
     return model_cls
 
 
-def get_index_model(source_model: type[models.Model]) -> type[models.Model]:
-    ui = haystack_connections["default"].get_unified_index()
+def get_index_model(
+    source_model: type[models.Model], connection_name: str = "default"
+) -> type[models.Model]:
+    ui = haystack_connections[connection_name].get_unified_index()
     search_index = ui.get_index(source_model)
-    return _build_index_model(source_model, search_index)
+    return _build_index_model(source_model, search_index, connection_name)
 
 
-def generate_index_models() -> dict[type[models.Model], type[models.Model]]:
-    ui = haystack_connections["default"].get_unified_index()
-    return {
-        source_model: _build_index_model(source_model, search_index)
-        for source_model, search_index in ui.get_indexes().items()
-    }
+def generate_index_models() -> dict[type[models.Model], dict[str, type[models.Model]]]:
+    models_dict: dict[type[models.Model], dict[str, type[models.Model]]] = {}
+    for connection_name in postgres_fts_backend_connection_names():
+        ui = haystack_connections[connection_name].get_unified_index()
+        for source_model, search_index in ui.get_indexes().items():
+            if source_model not in models_dict:
+                models_dict[source_model] = {}
+            models_dict[source_model][connection_name] = _build_index_model(
+                source_model, search_index, connection_name
+            )
+
+    return models_dict
 
 
-def _table_name(model: type[models.Model]) -> str:
-    return f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
+def _table_name(model: type[models.Model], connection_name: str) -> str:
+    table_name = f"haystack_index_{model._meta.app_label}_{model._meta.model_name}"
+    if connection_name != "default":
+        table_name = f"{table_name}_{connection_name}"
+    return table_name
 
 
 def validate_all_schemas() -> None:
     """Validate all index tables at startup. Called from AppConfig.ready()."""
-    try:
-        ui = haystack_connections["default"].get_unified_index()
-        existing_tables = connection.introspection.table_names()
-    except Exception:
-        warnings.warn(
-            "Could not connect to database to validate index schemas. "
-            "Run 'manage.py build_postgres_schema' then "
-            "'manage.py migrate postgres_fts_backend' once the database is available."
-        )
-        return
 
-    for model, index in ui.get_indexes().items():
-        table = _table_name(model)
-
-        if table not in existing_tables:
+    for connection_name in postgres_fts_backend_connection_names():
+        haystack_connection = haystack_connections[connection_name]
+        try:
+            ui = haystack_connection.get_unified_index()
+            existing_tables = connection.introspection.table_names()
+        except Exception:
             warnings.warn(
-                f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
-                "then 'manage.py migrate postgres_fts_backend'."
-            )
-            continue
-
-        expected_columns = {"id", "django_id", "django_ct", "search_vector"}
-        for field_name in index.fields:
-            if field_name not in ("django_ct", "django_id"):
-                expected_columns.add(field_name)
-
-        with connection.cursor() as cursor:
-            db_columns = {
-                info.name
-                for info in connection.introspection.get_table_description(
-                    cursor, table
-                )
-            }
-
-        missing = expected_columns - db_columns
-        if missing:
-            warnings.warn(
-                "Index table '{}' schema is out of date (missing columns: {}). "
+                "Could not connect to database to validate index schemas. "
                 "Run 'manage.py build_postgres_schema' then "
-                "'manage.py migrate postgres_fts_backend'.".format(
-                    table, ", ".join(sorted(missing))
-                )
+                "'manage.py migrate postgres_fts_backend' once the database is available."
             )
+            return
+
+        for model, index in ui.get_indexes().items():
+            table = _table_name(model, connection_name)
+
+            if table not in existing_tables:
+                warnings.warn(
+                    f"Table '{table}' does not exist. Run 'manage.py build_postgres_schema' "
+                    "then 'manage.py migrate postgres_fts_backend'."
+                )
+                continue
+
+            expected_columns = {"id", "django_id", "django_ct", "search_vector"}
+            for field_name in index.fields:
+                if field_name not in ("django_ct", "django_id"):
+                    expected_columns.add(field_name)
+
+            with connection.cursor() as cursor:
+                db_columns = {
+                    info.name
+                    for info in connection.introspection.get_table_description(
+                        cursor, table
+                    )
+                }
+
+            missing = expected_columns - db_columns
+            if missing:
+                warnings.warn(
+                    "Index table '{}' schema is out of date (missing columns: {}). "
+                    "Run 'manage.py build_postgres_schema' then "
+                    "'manage.py migrate postgres_fts_backend'.".format(
+                        table, ", ".join(sorted(missing))
+                    )
+                )

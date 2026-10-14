@@ -37,4 +37,5 @@ TEMPLATES = [
 
 HAYSTACK_CONNECTIONS = {
     "default": {"ENGINE": "postgres_fts_backend.PostgresFTSEngine"},
+    "another": {"ENGINE": "postgres_fts_backend.PostgresFTSEngine"},
 }
