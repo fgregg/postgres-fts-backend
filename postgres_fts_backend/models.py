@@ -274,17 +274,17 @@ def get_index_model(
 
 
 def generate_index_models() -> dict[type[models.Model], dict[str, type[models.Model]]]:
-    models = {}
+    models_dict: dict[type[models.Model], dict[str, type[models.Model]]] = {}
     for connection_name in postgres_fts_backend_connection_names():
         ui = haystack_connections[connection_name].get_unified_index()
         for source_model, search_index in ui.get_indexes().items():
-            if source_model not in models:
-                models[source_model] = {}
-            models[source_model][connection_name] = _build_index_model(
+            if source_model not in models_dict:
+                models_dict[source_model] = {}
+            models_dict[source_model][connection_name] = _build_index_model(
                 source_model, search_index, connection_name
             )
 
-    return models
+    return models_dict
 
 
 def _table_name(model: type[models.Model], connection_name: str) -> str:
