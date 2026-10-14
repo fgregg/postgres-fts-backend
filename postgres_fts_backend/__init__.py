@@ -380,9 +380,12 @@ class MultiIndexSearch:
     """Wraps multiple IndexSearch instances for cross-model search."""
 
     def __init__(
-        self, searches: list[tuple[IndexSearch, type[django_models.Model]]]
+        self,
+        searches: list[tuple[IndexSearch, type[django_models.Model]]],
+        connection_alias: str,
     ) -> None:
         self.searches = searches
+        self.connection_alias = connection_alias
 
     def count(self) -> int:
         return sum(s.count() for s, _model in self.searches)
@@ -401,7 +404,7 @@ class MultiIndexSearch:
                 col = _resolve_field_name(field_name)
                 combined_counts: dict[Any, int] = {}
                 for s, model in self.searches:
-                    index_model = get_index_model(model)
+                    index_model = get_index_model(model, self.connection_alias)
                     try:
                         index_model._meta.get_field(col)
                     except FieldDoesNotExist:
@@ -423,7 +426,7 @@ class MultiIndexSearch:
                 col = _resolve_field_name(field_name)
                 combined_buckets: dict[Any, int] = {}
                 for s, model in self.searches:
-                    index_model = get_index_model(model)
+                    index_model = get_index_model(model, self.connection_alias)
                     try:
                         index_model._meta.get_field(col)
                     except FieldDoesNotExist:
@@ -441,7 +444,7 @@ class MultiIndexSearch:
                 col = _resolve_field_name(field_name)
                 total = 0
                 for s, model in self.searches:
-                    index_model = get_index_model(model)
+                    index_model = get_index_model(model, self.connection_alias)
                     try:
                         index_model._meta.get_field(col)
                     except FieldDoesNotExist:
@@ -542,7 +545,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
     def update(self, index, iterable, commit=True):
         try:
             model = index.get_model()
-            index_model = get_index_model(model)
+            index_model = get_index_model(model, self.connection_alias)
             field_names = _field_names(index)
             content_field = index.get_content_field()
 
@@ -597,7 +600,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
                 django_ct = get_model_ct(model)
                 django_id = force_str(obj_or_string.pk)
 
-            index_model = get_index_model(model)
+            index_model = get_index_model(model, self.connection_alias)
             index_model.objects.filter(
                 django_ct=django_ct, django_id=django_id
             ).delete()
@@ -609,11 +612,11 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
     def clear(self, models=None, commit=True):
         try:
             if models is None:
-                ui = connections["default"].get_unified_index()
+                ui = connections[self.connection_alias].get_unified_index()
                 models = ui.get_indexes().keys()
 
             for model in models:
-                index_model = get_index_model(model)
+                index_model = get_index_model(model, self.connection_alias)
                 index_model.objects.all().delete()
         except DatabaseError:
             if not self.silently_fail:
@@ -626,7 +629,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
             return {"results": [], "hits": 0, "spelling_suggestion": None}
 
         try:
-            ui = connections["default"].get_unified_index()
+            ui = connections[self.connection_alias].get_unified_index()
 
             requested_models = kwargs.get("models")
             if requested_models:
@@ -648,7 +651,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
             # Build IndexSearch per model
             searches = []
             for model, index in model_index_pairs:
-                index_model = get_index_model(model)
+                index_model = get_index_model(model, self.connection_alias)
                 if orm_query is not None:
                     s = IndexSearch.from_orm_query(
                         index_model, index, self.search_config, orm_query
@@ -679,7 +682,7 @@ class PostgresFTSSearchBackend(BaseSearchBackend):
                 results = s.results(sort_by, start_offset, end_offset, result_class)
             else:
                 # Multi-model path
-                multi = MultiIndexSearch(searches)
+                multi = MultiIndexSearch(searches, self.connection_alias)
                 total_count = multi.count()
                 facets = multi.facets(
                     facets=kwargs.get("facets"),
@@ -790,7 +793,7 @@ class ORMSearchQuery(BaseSearchQuery):
 
     def _is_multivalued(self, field):
         """Check if a haystack field is multivalued (maps to ArrayField)."""
-        ui = connections["default"].get_unified_index()
+        ui = connections[self._using].get_unified_index()
         for index in ui.get_indexes().values():
             if field in index.fields:
                 return index.fields[field].is_multivalued
@@ -800,7 +803,7 @@ class ORMSearchQuery(BaseSearchQuery):
         """Return ``"edge"`` if *field* is an EdgeNgramField, ``"full"`` if a
         plain NgramField, else ``None``. EdgeNgramField subclasses NgramField,
         so it must be checked first."""
-        ui = connections["default"].get_unified_index()
+        ui = connections[self._using].get_unified_index()
         for index in ui.get_indexes().values():
             field_obj = index.fields.get(field)
             if field_obj is None:

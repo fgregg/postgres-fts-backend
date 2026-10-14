@@ -1453,35 +1453,47 @@ class TestBuildSchema(TestCase):
     def test_generated_class_name(self):
         """The MockModel index model's __name__ is 'HaystackIndex_Core_Mockmodel'."""
         schema = generate_index_models()
-        assert schema[MockModel].__name__ == "HaystackIndex_Core_Mockmodel"
+        assert schema[MockModel]["default"].__name__ == "HaystackIndex_Core_Mockmodel"
+        assert (
+            schema[MockModel]["another"].__name__
+            == "HaystackIndex_Core_Mockmodel_another"
+        )
 
     def test_table_name(self):
         """The MockModel index model's db_table is 'haystack_index_core_mockmodel'."""
         schema = generate_index_models()
-        assert schema[MockModel]._meta.db_table == "haystack_index_core_mockmodel"
+        assert (
+            schema[MockModel]["default"]._meta.db_table
+            == "haystack_index_core_mockmodel"
+        )
+        assert (
+            schema[MockModel]["another"]._meta.db_table
+            == "haystack_index_core_mockmodel_another"
+        )
 
     def test_required_base_fields_exist(self):
         """Every generated model has django_id, django_ct, and search_vector."""
         schema = generate_index_models()
-        for model_cls in schema.values():
-            field_names = {f.name for f in model_cls._meta.get_fields()}
-            assert "django_id" in field_names
-            assert "django_ct" in field_names
-            assert "search_vector" in field_names
+        for connection_models in schema.values():
+            for model_cls in connection_models.values():
+                field_names = {f.name for f in model_cls._meta.get_fields()}
+                assert "django_id" in field_names
+                assert "django_ct" in field_names
+                assert "search_vector" in field_names
 
-            django_id_field = model_cls._meta.get_field("django_id")
-            assert isinstance(django_id_field, models.CharField)
+                django_id_field = model_cls._meta.get_field("django_id")
+                assert isinstance(django_id_field, models.CharField)
 
-            django_ct_field = model_cls._meta.get_field("django_ct")
-            assert isinstance(django_ct_field, models.CharField)
+                django_ct_field = model_cls._meta.get_field("django_ct")
+                assert isinstance(django_ct_field, models.CharField)
 
-            sv_field = model_cls._meta.get_field("search_vector")
-            assert isinstance(sv_field, SearchVectorField)
+                sv_field = model_cls._meta.get_field("search_vector")
+                assert isinstance(sv_field, SearchVectorField)
 
     def test_haystack_fields_are_mapped(self):
         """MockModel's index model has text (TextField), author (TextField), pub_date (DateTimeField)."""
         schema = generate_index_models()
-        mock_model = schema[MockModel]
+        mock_model = schema[MockModel]["default"]
 
         text_field = mock_model._meta.get_field("text")
         assert isinstance(text_field, models.TextField)
@@ -1495,12 +1507,14 @@ class TestBuildSchema(TestCase):
     def test_unique_together(self):
         """_meta.unique_together is (('django_ct', 'django_id'),)."""
         schema = generate_index_models()
-        assert schema[MockModel]._meta.unique_together == (("django_ct", "django_id"),)
+        assert schema[MockModel]["default"]._meta.unique_together == (
+            ("django_ct", "django_id"),
+        )
 
     def test_gin_index_on_search_vector(self):
         """_meta.indexes has one GinIndex whose fields contains 'search_vector'."""
         schema = generate_index_models()
-        indexes = schema[MockModel]._meta.indexes
+        indexes = schema[MockModel]["default"]._meta.indexes
         gin_indexes = [idx for idx in indexes if isinstance(idx, GinIndex)]
         assert len(gin_indexes) == 1
         assert "search_vector" in gin_indexes[0].fields
@@ -1509,8 +1523,11 @@ class TestBuildSchema(TestCase):
         """Calling generate_index_models() twice returns identical model objects."""
         schema_a = generate_index_models()
         schema_b = generate_index_models()
-        assert schema_a[MockModel] is schema_b[MockModel]
-        assert schema_a[AnotherMockModel] is schema_b[AnotherMockModel]
+        assert schema_a[MockModel]["default"] is schema_b[MockModel]["default"]
+        assert (
+            schema_a[AnotherMockModel]["default"]
+            is schema_b[AnotherMockModel]["default"]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2290,7 +2307,7 @@ class TestTrigramSupport(TestCase):
         )
         try:
             schema = generate_index_models()
-            indexes = schema[MockModel]._meta.indexes
+            indexes = schema[MockModel]["default"]._meta.indexes
             trgm = [i for i in indexes if "trgm" in i.name]
             assert len(trgm) == 1
             assert "author_trgm" in trgm[0].name
